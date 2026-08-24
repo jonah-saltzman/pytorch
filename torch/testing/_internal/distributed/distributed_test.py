@@ -1,6 +1,7 @@
 # mypy: allow-untyped-defs
 
 import copy
+import io
 import itertools
 import json
 import math
@@ -482,23 +483,6 @@ def _lock():
             else:
                 fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
             lf.close()
-
-
-@contextmanager
-def _rank_temp_file():
-    if dist.get_rank() == 0:
-        fd, name = tempfile.mkstemp()
-        os.close(fd)
-    else:
-        name = None
-    object_list = [name]
-    dist.broadcast_object_list(object_list)
-    name = object_list[0]
-    try:
-        yield name
-    finally:
-        if dist.get_rank() == 0:
-            os.remove(name)
 
 
 def _build_tensor(size, value=None, dtype=torch.float, device_id=None):
@@ -5740,9 +5724,7 @@ class DistributedTest:
             loss.backward()
             optimizer.step()
 
-        def _test_post_localSGD_optimizer_step_reload(
-            self, create_averager, chkpt_file
-        ):
+        def _test_post_localSGD_optimizer_step_reload(self, create_averager):
             learning_rate = 0.03
 
             net_using_post_localSGD_opt = torch.nn.parallel.DistributedDataParallel(
@@ -5772,14 +5754,22 @@ class DistributedTest:
                     target,
                 )
 
+            # Broadcast the serialized checkpoint instead of sharing a file, so
+            # that no rank owns a resource whose lifetime the other ranks depend on.
             if self.rank == 0:
+                buffer = io.BytesIO()
                 torch.save(
-                    {"optimizer_state_dict": post_localSGD_opt.state_dict()}, chkpt_file
+                    {"optimizer_state_dict": post_localSGD_opt.state_dict()}, buffer
                 )
+                object_list = [buffer.getvalue()]
+            else:
+                object_list = [None]
+            dist.broadcast_object_list(object_list)
 
-            dist.barrier()
             map_location = {"cuda:0": f"cuda:{self.rank:d}"}
-            checkpoint = torch.load(chkpt_file, map_location=map_location)
+            checkpoint = torch.load(
+                io.BytesIO(object_list[0]), map_location=map_location
+            )
             dummy_post_localSGD_opt.load_state_dict(checkpoint["optimizer_state_dict"])
 
             # Check that we didn't hit the trivial case
@@ -5869,10 +5859,9 @@ class DistributedTest:
         )
         def test_post_localSGD_optimizer_step_reload(self):
             torch.cuda.set_device(self.rank)
-            with _rank_temp_file() as tmp_file:
-                self._test_post_localSGD_optimizer_step_reload(
-                    self._create_periodic_model_averager, tmp_file
-                )
+            self._test_post_localSGD_optimizer_step_reload(
+                self._create_periodic_model_averager
+            )
 
         @skip_but_pass_in_sandcastle_if(
             BACKEND not in DistTestCases.backend_feature["ddp"],
