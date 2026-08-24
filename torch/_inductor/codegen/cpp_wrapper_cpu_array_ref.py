@@ -459,7 +459,7 @@ class CppWrapperCpuArrayRef(CppWrapperCpu):
                         extern "C" AOTIRuntimeError AOTInductorModelRunMinimalArrayrefInterface(
                             AOTInductorModelHandle model_handle,
                             const AOTInductorModelInputs& inputs,
-                            AOTInductorModelOutputs& outputs) {
+                            AOTInductorModelOutputs& outputs) try {
                           auto model = reinterpret_cast<torch::aot_inductor::AOTInductorModel*>(model_handle);
                           CONVERT_EXCEPTION_TO_ERROR_CODE({
                               outputs = model->run_impl_minimal_arrayref_interface<AOTInductorModelInputs, AOTInductorModelOutputs>(
@@ -467,7 +467,7 @@ class CppWrapperCpuArrayRef(CppWrapperCpu):
                                   (torch::aot_inductor::DeviceStreamType)nullptr,
                                   nullptr);
                           })
-                        }
+                        } AOTI_RUNTIME_TERMINATE_ON_EXCEPTION
                     """
                     )
 
@@ -482,7 +482,7 @@ class CppWrapperCpuArrayRef(CppWrapperCpu):
                             int32_t num_inputs,
                             const AOTInductorArrayRefTensor* c_inputs,
                             int32_t num_outputs,
-                            AOTInductorArrayRefTensor* c_outputs) {{
+                            AOTInductorArrayRefTensor* c_outputs) try {{
                           constexpr int32_t expected_num_inputs = {len(V.graph.graph_inputs)};
                           constexpr int32_t expected_num_outputs = {len(V.graph.graph_outputs)};
                           auto model = reinterpret_cast<torch::aot_inductor::AOTInductorModel*>(model_handle);
@@ -515,7 +515,7 @@ class CppWrapperCpuArrayRef(CppWrapperCpu):
                                   (torch::aot_inductor::DeviceStreamType)nullptr,
                                   nullptr);
                           }})
-                        }}
+                        }} AOTI_RUNTIME_TERMINATE_ON_EXCEPTION
                     """
                     )
                 else:

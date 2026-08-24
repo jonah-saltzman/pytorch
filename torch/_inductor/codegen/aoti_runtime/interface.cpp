@@ -107,20 +107,19 @@ AOTIRuntimeError AOTInductorModelContainerCreate(
     AOTInductorModelContainerHandle* container_handle,
     size_t num_models,
     bool is_cpu,
-    const char* cubin_dir) {
+    const char* cubin_dir) try {
       return AOTInductorModelContainerCreateWithDevice(
         container_handle,
         num_models,
         is_cpu ? "cpu" : "cuda",
         cubin_dir);
-}
+} AOTI_RUNTIME_TERMINATE_ON_EXCEPTION
 
 AOTIRuntimeError AOTInductorModelContainerCreateWithDevice(
     AOTInductorModelContainerHandle* container_handle,
     size_t num_models,
     const char* device_str,
-    const char* cubin_dir) {
-
+    const char* cubin_dir) try {
   if (num_models == 0) {
     std::cerr << "Error: num_models must be positive, but got 0\n";
     return AOTI_RUNTIME_FAILURE;
@@ -135,7 +134,7 @@ AOTIRuntimeError AOTInductorModelContainerCreateWithDevice(
     *container_handle =
         reinterpret_cast<AOTInductorModelContainerHandle>(container);
   })
-}
+} AOTI_RUNTIME_TERMINATE_ON_EXCEPTION
 
 
 AOTIRuntimeError AOTInductorModelContainerCreateWithExternalConstants(
@@ -144,7 +143,7 @@ AOTIRuntimeError AOTInductorModelContainerCreateWithExternalConstants(
     const char* device_str,
     const char* cubin_dir,
     const AOTInductorConstantMapEntry* constant_entries,
-    size_t num_constant_entries) {
+    size_t num_constant_entries) try {
   if (num_models == 0) {
     std::cerr << "Error: num_models must be positive, but got 0\n";
     return AOTI_RUNTIME_FAILURE;
@@ -174,17 +173,17 @@ AOTIRuntimeError AOTInductorModelContainerCreateWithExternalConstants(
     *container_handle =
         reinterpret_cast<AOTInductorModelContainerHandle>(container);
   })
-}
+} AOTI_RUNTIME_TERMINATE_ON_EXCEPTION
 
 AOTIRuntimeError AOTInductorModelContainerDelete(
-    AOTInductorModelContainerHandle container_handle) {
+    AOTInductorModelContainerHandle container_handle) try {
   CONVERT_EXCEPTION_TO_ERROR_CODE({
     auto* container =
         reinterpret_cast<torch::aot_inductor::AOTInductorModelContainer*>(
             container_handle);
     delete container;
   });
-}
+} AOTI_RUNTIME_TERMINATE_ON_EXCEPTION
 
 AOTIRuntimeError AOTInductorModelContainerRun(
     AOTInductorModelContainerHandle container_handle,
@@ -197,7 +196,7 @@ AOTIRuntimeError AOTInductorModelContainerRun(
                         // borrowed
     size_t num_outputs,
     AOTInductorStreamHandle stream_handle,
-    AOTIProxyExecutorHandle proxy_executor_handle) {
+    AOTIProxyExecutorHandle proxy_executor_handle) try {
   auto* container =
       reinterpret_cast<torch::aot_inductor::AOTInductorModelContainer*>(
           container_handle);
@@ -211,7 +210,7 @@ AOTIRuntimeError AOTInductorModelContainerRun(
     container->run(
         input_handles, output_handles, stream, proxy_executor_handle);
   })
-}
+} AOTI_RUNTIME_TERMINATE_ON_EXCEPTION
 
 AOTIRuntimeError AOTInductorModelContainerRunSingleThreaded(
     AOTInductorModelContainerHandle container_handle,
@@ -224,7 +223,7 @@ AOTIRuntimeError AOTInductorModelContainerRunSingleThreaded(
                         // borrowed
     size_t num_outputs,
     AOTInductorStreamHandle stream_handle,
-    AOTIProxyExecutorHandle proxy_executor_handle) {
+    AOTIProxyExecutorHandle proxy_executor_handle) try {
   auto* container =
       reinterpret_cast<torch::aot_inductor::AOTInductorModelContainer*>(
           container_handle);
@@ -238,84 +237,84 @@ AOTIRuntimeError AOTInductorModelContainerRunSingleThreaded(
     container->run_single_threaded(
         input_handles, output_handles, stream, proxy_executor_handle);
   })
-}
+} AOTI_RUNTIME_TERMINATE_ON_EXCEPTION
 
 AOTIRuntimeError AOTInductorModelContainerGetNumConstants(
     AOTInductorModelContainerHandle container_handle,
-    size_t* num_constants) {
+    size_t* num_constants) try {
   auto* container =
       reinterpret_cast<torch::aot_inductor::AOTInductorModelContainer*>(
           container_handle);
   CONVERT_EXCEPTION_TO_ERROR_CODE(
     { *num_constants = container->num_constants(); })
-}
+} AOTI_RUNTIME_TERMINATE_ON_EXCEPTION
 
 AOTIRuntimeError AOTInductorModelContainerGetConstantName(
     AOTInductorModelContainerHandle container_handle,
     size_t idx,
-    const char** name) {
+    const char** name) try {
   auto* container =
       reinterpret_cast<torch::aot_inductor::AOTInductorModelContainer*>(
           container_handle);
   CONVERT_EXCEPTION_TO_ERROR_CODE(
     { *name = container->constant_name(idx); })
-}
+} AOTI_RUNTIME_TERMINATE_ON_EXCEPTION
 
 AOTIRuntimeError AOTInductorModelContainerGetConstantOriginalFQN(
     AOTInductorModelContainerHandle container_handle,
     size_t idx,
-    const char** original_fqn) {
+    const char** original_fqn) try {
   auto* container =
       reinterpret_cast<torch::aot_inductor::AOTInductorModelContainer*>(
           container_handle);
   CONVERT_EXCEPTION_TO_ERROR_CODE(
     { *original_fqn = container->constant_original_fqn(idx); })
-}
+} AOTI_RUNTIME_TERMINATE_ON_EXCEPTION
 
 AOTIRuntimeError AOTInductorModelContainerGetConstantFromFolded(
     AOTInductorModelContainerHandle container_handle,
     size_t idx,
-    bool* from_folded) {
+    bool* from_folded) try {
   auto* container =
       reinterpret_cast<torch::aot_inductor::AOTInductorModelContainer*>(container_handle);
   CONVERT_EXCEPTION_TO_ERROR_CODE({ *from_folded = container->constant_from_folded(idx); })
-}
+} AOTI_RUNTIME_TERMINATE_ON_EXCEPTION
 
 AOTIRuntimeError AOTInductorModelContainerGetConstantType(
     AOTInductorModelContainerHandle container_handle,
     size_t idx,
-    int32_t* type) {
+    int32_t* type) try {
   auto* container =
       reinterpret_cast<torch::aot_inductor::AOTInductorModelContainer*>(container_handle);
   CONVERT_EXCEPTION_TO_ERROR_CODE({ *type = container->constant_type(idx); })
-}
+} AOTI_RUNTIME_TERMINATE_ON_EXCEPTION
 
 AOTIRuntimeError AOTInductorModelContainerGetConstantDtype(
     AOTInductorModelContainerHandle container_handle,
     size_t idx,
-    int32_t* dtype) {
+    int32_t* dtype) try {
   auto* container =
       reinterpret_cast<torch::aot_inductor::AOTInductorModelContainer*>(
           container_handle);
   CONVERT_EXCEPTION_TO_ERROR_CODE(
     { *dtype = container->constant_dtype(idx); })
-}
+} AOTI_RUNTIME_TERMINATE_ON_EXCEPTION
 
 AOTIRuntimeError AOTInductorModelContainerGetConstantDataSize(
   AOTInductorModelContainerHandle container_handle,
   size_t idx,
-  size_t* data_size) {
+  size_t* data_size) try {
   auto* container =
     reinterpret_cast<torch::aot_inductor::AOTInductorModelContainer*>(
         container_handle);
   CONVERT_EXCEPTION_TO_ERROR_CODE(
     { *data_size = container->constant_data_size(idx); })
-}
+} AOTI_RUNTIME_TERMINATE_ON_EXCEPTION
 
 AOTIRuntimeError AOTInductorModelContainerExtractConstantsMap(
     AOTInductorModelContainerHandle container_handle,
     AOTInductorConstantMapHandle constant_map_handle,
-    bool use_inactive) {
+    bool use_inactive) try {
   auto* container =
       reinterpret_cast<torch::aot_inductor::AOTInductorModelContainer*>(
           container_handle);
@@ -326,13 +325,13 @@ AOTIRuntimeError AOTInductorModelContainerExtractConstantsMap(
         constants_map->emplace(pair.first, pair.second);
       }
     })
-}
+} AOTI_RUNTIME_TERMINATE_ON_EXCEPTION
 
 AOTIRuntimeError AOTInductorModelContainerExtractConstantsMapEntries(
     AOTInductorModelContainerHandle container_handle,
     const AOTInductorConstantMapEntry** entries,
     size_t* num_entries,
-    bool use_inactive) {
+    bool use_inactive) try {
   if (!entries || !num_entries) {
     return AOTI_RUNTIME_FAILURE;
   }
@@ -345,13 +344,13 @@ AOTIRuntimeError AOTInductorModelContainerExtractConstantsMapEntries(
     *entries = extracted.empty() ? nullptr : extracted.data();
     *num_entries = extracted.size();
   })
-}
+} AOTI_RUNTIME_TERMINATE_ON_EXCEPTION
 
 AOTIRuntimeError AOTInductorModelContainerUpdateUserManagedConstantBuffer(
     AOTInductorModelContainerHandle container_handle,
     AOTInductorConstantMapHandle constant_map_handle,
     bool use_inactive,
-    bool validate_full_update) {
+    bool validate_full_update) try {
   auto* container =
       reinterpret_cast<torch::aot_inductor::AOTInductorModelContainer*>(
           container_handle);
@@ -360,14 +359,14 @@ AOTIRuntimeError AOTInductorModelContainerUpdateUserManagedConstantBuffer(
     container->update_constant_buffer(
         *input_map, use_inactive, validate_full_update, /* user_managed = */ true);
   })
-}
+} AOTI_RUNTIME_TERMINATE_ON_EXCEPTION
 
 AOTIRuntimeError AOTInductorModelContainerUpdateUserManagedConstantBufferPairs(
     AOTInductorModelContainerHandle container_handle,
     const AOTInductorConstantMapEntry* pairs,
     size_t num_pairs,
     bool use_inactive,
-    bool validate_full_update) {
+    bool validate_full_update) try {
   auto* container =
       reinterpret_cast<torch::aot_inductor::AOTInductorModelContainer*>(container_handle);
   // Build a local unordered_map inside
@@ -380,13 +379,13 @@ AOTIRuntimeError AOTInductorModelContainerUpdateUserManagedConstantBufferPairs(
     container->update_constant_buffer(
         input_map, use_inactive, validate_full_update, /*user_managed=*/true);
   })
-}
+} AOTI_RUNTIME_TERMINATE_ON_EXCEPTION
 
 AOTIRuntimeError AOTInductorModelContainerUpdateConstantBuffer(
     AOTInductorModelContainerHandle container_handle,
     AOTInductorConstantMapHandle constant_map_handle,
     bool use_inactive,
-    bool validate_full_update) {
+    bool validate_full_update) try {
   auto* container =
       reinterpret_cast<torch::aot_inductor::AOTInductorModelContainer*>(
           container_handle);
@@ -395,14 +394,14 @@ AOTIRuntimeError AOTInductorModelContainerUpdateConstantBuffer(
     container->update_constant_buffer(
         *input_map, use_inactive, validate_full_update);
   })
-}
+} AOTI_RUNTIME_TERMINATE_ON_EXCEPTION
 
 AOTIRuntimeError AOTInductorModelContainerUpdateConstantBufferPairs(
     AOTInductorModelContainerHandle container_handle,
     const AOTInductorConstantMapEntry* pairs,
     size_t num_pairs,
     bool use_inactive,
-    bool validate_full_update) {
+    bool validate_full_update) try {
   auto* container =
       reinterpret_cast<torch::aot_inductor::AOTInductorModelContainer*>(
           container_handle);
@@ -411,13 +410,13 @@ AOTIRuntimeError AOTInductorModelContainerUpdateConstantBufferPairs(
     container->update_constant_buffer(
         input_map, use_inactive, validate_full_update);
   })
-}
+} AOTI_RUNTIME_TERMINATE_ON_EXCEPTION
 
 AOTIRuntimeError AOTInductorModelContainerUpdateConstantBufferFromCpu(
     AOTInductorModelContainerHandle container_handle,
     AOTInductorConstantMapHandle constant_map_handle,
     bool use_inactive,
-    bool validate_full_update) {
+    bool validate_full_update) try {
   auto* container =
       reinterpret_cast<torch::aot_inductor::AOTInductorModelContainer*>(
           container_handle);
@@ -430,14 +429,14 @@ AOTIRuntimeError AOTInductorModelContainerUpdateConstantBufferFromCpu(
         /*user_managed=*/false,
         /*allow_h2d_copy=*/true);
   })
-}
+} AOTI_RUNTIME_TERMINATE_ON_EXCEPTION
 
 AOTIRuntimeError AOTInductorModelContainerUpdateConstantBufferFromCpuPairs(
     AOTInductorModelContainerHandle container_handle,
     const AOTInductorConstantMapEntry* pairs,
     size_t num_pairs,
     bool use_inactive,
-    bool validate_full_update) {
+    bool validate_full_update) try {
   auto* container =
       reinterpret_cast<torch::aot_inductor::AOTInductorModelContainer*>(
           container_handle);
@@ -450,45 +449,45 @@ AOTIRuntimeError AOTInductorModelContainerUpdateConstantBufferFromCpuPairs(
         /*user_managed=*/false,
         /*allow_h2d_copy=*/true);
   })
-}
+} AOTI_RUNTIME_TERMINATE_ON_EXCEPTION
 
 AOTIRuntimeError AOTInductorModelContainerUpdateInactiveConstantBuffer(
     AOTInductorModelContainerHandle container_handle,
-    AOTInductorConstantMapHandle constant_map_handle) {
+    AOTInductorConstantMapHandle constant_map_handle) try {
   return AOTInductorModelContainerUpdateConstantBuffer(
       container_handle,
       constant_map_handle,
       /*use_inactive=*/true,
       /*validate_full_update=*/true);
-}
+} AOTI_RUNTIME_TERMINATE_ON_EXCEPTION
 
 AOTIRuntimeError AOTInductorModelContainerUpdateInactiveConstantBufferPairs(
     AOTInductorModelContainerHandle container_handle,
     const AOTInductorConstantMapEntry* pairs,
-    size_t num_pairs) {
+    size_t num_pairs) try {
   return AOTInductorModelContainerUpdateConstantBufferPairs(
       container_handle,
       pairs,
       num_pairs,
       /*use_inactive=*/true,
       /*validate_full_update=*/true);
-}
+} AOTI_RUNTIME_TERMINATE_ON_EXCEPTION
 
 AOTIRuntimeError AOTInductorModelContainerFreeInactiveConstantBuffer(
-    AOTInductorModelContainerHandle container_handle) {
+    AOTInductorModelContainerHandle container_handle) try {
   auto* container =
       reinterpret_cast<torch::aot_inductor::AOTInductorModelContainer*>(
           container_handle);
   CONVERT_EXCEPTION_TO_ERROR_CODE({
     container->free_inactive_constant_buffer();
   })
-}
+} AOTI_RUNTIME_TERMINATE_ON_EXCEPTION
 
 AOTIRuntimeError AOTInductorModelContainerRunConstantFolding(
     AOTInductorModelContainerHandle container_handle,
     bool use_inactive,
     AOTInductorStreamHandle stream_handle,
-    AOTIProxyExecutorHandle proxy_executor_handle) {
+    AOTIProxyExecutorHandle proxy_executor_handle) try {
   auto* container =
       reinterpret_cast<torch::aot_inductor::AOTInductorModelContainer*>(
           container_handle);
@@ -498,64 +497,64 @@ AOTIRuntimeError AOTInductorModelContainerRunConstantFolding(
     AOTINoGradGuard guard;
     container->run_const_fold(use_inactive, stream, proxy_executor_handle);
   })
-}
+} AOTI_RUNTIME_TERMINATE_ON_EXCEPTION
 
 AOTIRuntimeError AOTInductorModelContainerSwapConstantBuffer(
-    AOTInductorModelContainerHandle container_handle) {
+    AOTInductorModelContainerHandle container_handle) try {
   auto* container =
       reinterpret_cast<torch::aot_inductor::AOTInductorModelContainer*>(
           container_handle);
   CONVERT_EXCEPTION_TO_ERROR_CODE({
     container->swap_constant_buffer();
   })
-}
+} AOTI_RUNTIME_TERMINATE_ON_EXCEPTION
 
 AOTIRuntimeError AOTInductorModelContainerGetNumInputs(
     AOTInductorModelContainerHandle container_handle,
-    size_t* ret_num_inputs) {
+    size_t* ret_num_inputs) try {
   auto* container =
       reinterpret_cast<torch::aot_inductor::AOTInductorModelContainer*>(
           container_handle);
   CONVERT_EXCEPTION_TO_ERROR_CODE(
       { *ret_num_inputs = container->num_inputs(); })
-}
+} AOTI_RUNTIME_TERMINATE_ON_EXCEPTION
 
 AOTIRuntimeError AOTInductorModelContainerGetInputName(
     AOTInductorModelContainerHandle container_handle,
     size_t input_idx,
-    const char** ret_input_names) {
+    const char** ret_input_names) try {
   auto* container =
       reinterpret_cast<torch::aot_inductor::AOTInductorModelContainer*>(
           container_handle);
   CONVERT_EXCEPTION_TO_ERROR_CODE(
       { *ret_input_names = container->input_name(input_idx); })
-}
+} AOTI_RUNTIME_TERMINATE_ON_EXCEPTION
 
 AOTIRuntimeError AOTInductorModelContainerGetNumOutputs(
     AOTInductorModelContainerHandle container_handle,
-    size_t* ret_num_outputs) {
+    size_t* ret_num_outputs) try {
   auto* container =
       reinterpret_cast<torch::aot_inductor::AOTInductorModelContainer*>(
           container_handle);
   CONVERT_EXCEPTION_TO_ERROR_CODE(
       { *ret_num_outputs = container->num_outputs(); })
-}
+} AOTI_RUNTIME_TERMINATE_ON_EXCEPTION
 
 AOTIRuntimeError AOTInductorModelContainerGetOutputName(
     AOTInductorModelContainerHandle container_handle,
     size_t output_idx,
-    const char** ret_output_names) {
+    const char** ret_output_names) try {
   auto* container =
       reinterpret_cast<torch::aot_inductor::AOTInductorModelContainer*>(
           container_handle);
   CONVERT_EXCEPTION_TO_ERROR_CODE(
       { *ret_output_names = container->output_name(output_idx); })
-}
+} AOTI_RUNTIME_TERMINATE_ON_EXCEPTION
 
 AOTIRuntimeError AOTInductorModelContainerGetCallSpec(
     AOTInductorModelContainerHandle container_handle,
     const char** in_spec,
-    const char** out_spec) {
+    const char** out_spec) try {
   auto* container =
       reinterpret_cast<torch::aot_inductor::AOTInductorModelContainer*>(
           container_handle);
@@ -563,11 +562,11 @@ AOTIRuntimeError AOTInductorModelContainerGetCallSpec(
     *in_spec = container->get_in_spec();
     *out_spec = container->get_out_spec();
   })
-}
+} AOTI_RUNTIME_TERMINATE_ON_EXCEPTION
 
 AOTIRuntimeError AOTInductorModelCreate(
     AOTInductorModelHandle* model_handle,
-    AOTInductorConstantMapHandle constant_map_handle) {
+    AOTInductorConstantMapHandle constant_map_handle) try {
   return createModelImpl(
       model_handle, constant_map_handle == nullptr, [=](auto& constant_map) {
         auto* input_map = reinterpret_cast<
@@ -579,12 +578,12 @@ AOTIRuntimeError AOTInductorModelCreate(
           }
         }
       });
-}
+} AOTI_RUNTIME_TERMINATE_ON_EXCEPTION
 
 AOTIRuntimeError AOTInductorModelCreateV2(
     AOTInductorModelHandle* model_handle,
     const AOTInductorConstantMapEntry* pairs,
-    size_t num_pairs) {
+    size_t num_pairs) try {
   return createModelImpl(
       model_handle, pairs == nullptr || num_pairs == 0, [=](auto& constant_map) {
         if (pairs && num_pairs > 0) {
@@ -594,12 +593,12 @@ AOTIRuntimeError AOTInductorModelCreateV2(
           }
         }
       });
-}
+} AOTI_RUNTIME_TERMINATE_ON_EXCEPTION
 
 AOTIRuntimeError AOTInductorModelRun(
     AOTInductorModelHandle model_handle,
     AtenTensorHandle* input_handles,
-    AtenTensorHandle* output_handles) {
+    AtenTensorHandle* output_handles) try {
   auto model =
       reinterpret_cast<torch::aot_inductor::AOTInductorModel*>(model_handle);
   CONVERT_EXCEPTION_TO_ERROR_CODE({
@@ -610,27 +609,28 @@ AOTIRuntimeError AOTInductorModelRun(
         (torch::aot_inductor::DeviceStreamType) nullptr,
         nullptr);
   })
-}
+} AOTI_RUNTIME_TERMINATE_ON_EXCEPTION
 
-AOTIRuntimeError AOTInductorModelDelete(AOTInductorModelHandle model_handle){
+AOTIRuntimeError AOTInductorModelDelete(
+    AOTInductorModelHandle model_handle) try {
     CONVERT_EXCEPTION_TO_ERROR_CODE({
       auto model = reinterpret_cast<torch::aot_inductor::AOTInductorModel*>(
           model_handle);
       delete model;
-    })}
+    })} AOTI_RUNTIME_TERMINATE_ON_EXCEPTION
 
 AOTIRuntimeError AOTInductorModelGetNumOutputs(
     AOTInductorModelHandle model_handle,
-    size_t* ret_num_outputs) {
+    size_t* ret_num_outputs) try {
   CONVERT_EXCEPTION_TO_ERROR_CODE({
       auto model = reinterpret_cast<torch::aot_inductor::AOTInductorModel*>(model_handle);
       *ret_num_outputs = model->num_outputs();
   })
-}
+} AOTI_RUNTIME_TERMINATE_ON_EXCEPTION
 
 AOTIRuntimeError AOTInductorModelUpdateConstantsMap(
     AOTInductorModelHandle model_handle,
-    AOTInductorConstantMapHandle constant_map_handle) {
+    AOTInductorConstantMapHandle constant_map_handle) try {
   auto model =
       reinterpret_cast<torch::aot_inductor::AOTInductorModel*>(model_handle);
   CONVERT_EXCEPTION_TO_ERROR_CODE({
@@ -644,7 +644,7 @@ AOTIRuntimeError AOTInductorModelUpdateConstantsMap(
     }
     model->update_constants_map(std::move(constant_map));
   })
-}
+} AOTI_RUNTIME_TERMINATE_ON_EXCEPTION
 
 // C-ABI-safe variant: uses an array of (name, handle) pairs instead of an
 // opaque pointer to std::unordered_map, so the host and DSO can use
@@ -652,7 +652,7 @@ AOTIRuntimeError AOTInductorModelUpdateConstantsMap(
 AOTIRuntimeError AOTInductorModelUpdateConstantsMapV2(
     AOTInductorModelHandle model_handle,
     const AOTInductorConstantMapEntry* pairs,
-    int32_t num_pairs) {
+    int32_t num_pairs) try {
   auto model =
       reinterpret_cast<torch::aot_inductor::AOTInductorModel*>(model_handle);
   CONVERT_EXCEPTION_TO_ERROR_CODE({
@@ -663,57 +663,58 @@ AOTIRuntimeError AOTInductorModelUpdateConstantsMapV2(
     }
     model->update_constants_map(std::move(constant_map));
   })
-}
+} AOTI_RUNTIME_TERMINATE_ON_EXCEPTION
 
 AOTIRuntimeError AOTInductorModelContainerGetConstantsBlobSize(
     AOTInductorModelContainerHandle container_handle,
-    uint64_t* ret_size) {
+    uint64_t* ret_size) try {
   auto* container =
       reinterpret_cast<torch::aot_inductor::AOTInductorModelContainer*>(
           container_handle);
   CONVERT_EXCEPTION_TO_ERROR_CODE(
       { *ret_size = container->constant_blob_size(); })
-}
+} AOTI_RUNTIME_TERMINATE_ON_EXCEPTION
 
 AOTIRuntimeError AOTInductorModelContainerDidCallLoadConstants(
     AOTInductorModelContainerHandle container_handle,
-    bool* did_call_load_constants) {
+    bool* did_call_load_constants) try {
   auto* container =
       reinterpret_cast<torch::aot_inductor::AOTInductorModelContainer*>(
           container_handle);
   CONVERT_EXCEPTION_TO_ERROR_CODE(
       { *did_call_load_constants = container->did_call_load_constants(); })
-}
+} AOTI_RUNTIME_TERMINATE_ON_EXCEPTION
 
 
 // Load weights from a single blob in weight_blob_ptr
 AOTIRuntimeError AOTInductorModelUpdateConstantsFromBlob(
     AOTInductorModelContainerHandle container_handle,
-    const uint8_t* weight_blob_ptr){
+    const uint8_t* weight_blob_ptr) try {
     auto* container =
       reinterpret_cast<torch::aot_inductor::AOTInductorModelContainer*>(
           container_handle);
   CONVERT_EXCEPTION_TO_ERROR_CODE(
       {container->update_constants_from_blob(weight_blob_ptr); })
-    }
+    } AOTI_RUNTIME_TERMINATE_ON_EXCEPTION
 
-AOTIRuntimeError AOTInductorSetUsePinnedAsyncConstantsCopy(bool enabled) {
+AOTIRuntimeError AOTInductorSetUsePinnedAsyncConstantsCopy(
+    bool enabled) try {
   CONVERT_EXCEPTION_TO_ERROR_CODE({
     torch::aot_inductor::setUsePinnedAsyncConstantsCopy(enabled);
   })
-}
+} AOTI_RUNTIME_TERMINATE_ON_EXCEPTION
 
 AOTIRuntimeError AOTInductorSetPinnedAsyncConstantsCopyStageBufferBytes(
-    size_t bytes) {
+    size_t bytes) try {
   CONVERT_EXCEPTION_TO_ERROR_CODE({
     torch::aot_inductor::setPinnedAsyncConstantsCopyStageBufferBytes(bytes);
   })
-}
+} AOTI_RUNTIME_TERMINATE_ON_EXCEPTION
 
 AOTIRuntimeError AOTInductorGetLastError(
-    const char** error_msg) {
+    const char** error_msg) try {
   *error_msg = g_aoti_last_error.c_str();
   return AOTI_RUNTIME_SUCCESS;
-}
+} AOTI_RUNTIME_TERMINATE_ON_EXCEPTION
 
 } // extern "C"

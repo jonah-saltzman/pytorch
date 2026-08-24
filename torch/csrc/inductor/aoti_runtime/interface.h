@@ -4,6 +4,8 @@
 // in model.so, and should not refer to any aten/c10 headers except the stable
 // C ABI defined in torch/csrc/inductor/aoti_torch/c/shim.h. The same rule
 // applies to other files under torch/csrc/inductor/aoti_runtime/.
+#include <exception>
+
 #include <torch/csrc/inductor/aoti_runtime/utils.h>
 
 #ifdef _WIN32
@@ -16,6 +18,11 @@ the import case.
 #else
 #define AOTI_API __attribute__((__visibility__("default")))
 #endif
+
+#define AOTI_RUNTIME_TERMINATE_ON_EXCEPTION \
+  catch (...) {                            \
+    std::terminate();                      \
+  }
 
 extern "C" {
 struct AOTInductorModelOpaque;
