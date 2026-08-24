@@ -218,7 +218,7 @@ if [[ -z "${OMP_NUM_THREADS:-}" ]] && [[ -n "${USE_ARC:-}" ]]; then
 fi
 
 if [[ "$BUILD_ENVIRONMENT" == *rocm* ]]; then
-  export OMP_NUM_THREADS=$(( $(nproc) / 4 ))
+  export OMP_NUM_THREADS=$(( $(nproc) / 8 ))
 fi
 
 export LANG=C.UTF-8
