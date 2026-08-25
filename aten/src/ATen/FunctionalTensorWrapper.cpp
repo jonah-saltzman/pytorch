@@ -363,20 +363,21 @@ void FunctionalTensorWrapper::sync_() {
     return;
   }
   apply_updates();
-  regenerate_from_base();
+  regenerate_from_base(/*single_output_replay=*/true);
 }
 
 const std::vector<std::shared_ptr<functionalization::ViewMeta>>& FunctionalTensorWrapper::view_metas() const {
   return view_metas_;
 }
 
-void FunctionalTensorWrapper::regenerate_from_base() {
+void FunctionalTensorWrapper::regenerate_from_base(bool single_output_replay) {
   at::AutoDispatchSkipFunctionalize guard;
   auto storage_impl = functional_storage_impl();
   auto t = storage_impl->base();
 
   TORCH_INTERNAL_ASSERT(!at::functionalization::impl::isFunctionalTensor(t));
-  t = at::functionalization::impl::apply_view_meta_sequence(t, view_metas_);
+  t = at::functionalization::impl::apply_view_meta_sequence(
+      t, view_metas_, single_output_replay);
   TORCH_INTERNAL_ASSERT(!at::functionalization::impl::isFunctionalTensor(t));
 
   replace_(t, /*from_lazy_regenerate=*/true);
@@ -792,10 +793,11 @@ void mutate_view_meta(const at::Tensor& self, const std::shared_ptr<functionaliz
 
 Tensor apply_view_meta_sequence(
     const Tensor& base,
-    const std::vector<std::shared_ptr<functionalization::ViewMeta>>& sequence) {
+    const std::vector<std::shared_ptr<functionalization::ViewMeta>>& sequence,
+    bool single_output_replay) {
   Tensor r = base;
   for (auto& vm : sequence) {
-    r = vm->forward(r);
+    r = single_output_replay ? vm->forward_single_output(r) : vm->forward(r);
   }
   return r;
 }
