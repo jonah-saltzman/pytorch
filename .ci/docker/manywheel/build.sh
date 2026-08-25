@@ -79,8 +79,8 @@ case ${image} in
         DEVTOOLSET_VERSION="13"
         # Common gfx arch list shared by all ROCm builds; each path extends it.
         PYTORCH_ROCM_ARCH="gfx908;gfx90a;gfx942;gfx950;gfx1030;gfx1100;gfx1101;gfx1102;gfx1103;gfx1200;gfx1201;gfx1150;gfx1151"
-        if [[ "$GPU_ARCH_VERSION" == *"7.14"* ]]; then
-            # ROCm 7.14 installs from the TheRock multi-arch wheel index instead of
+        if [[ "$GPU_ARCH_VERSION" == *"7.14"* || "$GPU_ARCH_VERSION" == *"10.0"* ]]; then
+            # Newer ROCm releases install from the TheRock multi-arch wheel index instead of
             # rocm/dev-almalinux-8 OS packages; start from a plain almalinux base.
             TARGET=rocm_final
             GPU_IMAGE=amd64/almalinux:8
