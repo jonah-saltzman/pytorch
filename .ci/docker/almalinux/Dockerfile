@@ -81,6 +81,9 @@ ENV PYTORCH_ROCM_ARCH ${PYTORCH_ROCM_ARCH}
 ENV LC_ALL en_US.UTF-8
 ENV LANG en_US.UTF-8
 ENV LANGUAGE en_US.UTF-8
+# TheRock wheels require Python 3.10+; AlmaLinux 8's system Python is too old.
+COPY --from=conda /opt/conda /opt/conda
+ENV PATH=/opt/conda/bin:$PATH
 ADD ./common/install_mkl.sh install_mkl.sh
 RUN bash ./install_mkl.sh && rm install_mkl.sh
 ENV MKLROOT /opt/intel
@@ -88,10 +91,18 @@ ENV MKLROOT /opt/intel
 RUN yum install -y libatomic
 
 FROM rocm_base as rocm
+ARG DEVTOOLSET_VERSION=13
 ARG ROCM_VERSION
 ARG THEROCK_INDEX_URL
 ADD ./common/install_rocm.sh install_rocm.sh
-RUN THEROCK_INDEX_URL=${THEROCK_INDEX_URL} ROCM_VERSION=${ROCM_VERSION} bash ./install_rocm.sh && rm install_rocm.sh
+RUN THEROCK_INDEX_URL=${THEROCK_INDEX_URL} ROCM_VERSION=${ROCM_VERSION} bash ./install_rocm.sh && \
+    rm install_rocm.sh && \
+    . /etc/rocm_env.sh && \
+    echo "--gcc-toolchain=/opt/rh/gcc-toolset-${DEVTOOLSET_VERSION}/root/usr" >> "${ROCM_HOME}/llvm/bin/rocm.cfg" && \
+    hipcc --version && \
+    test -e "${ROCM_HOME}/lib/libamdhip64.so"
+# Builder scripts run non-interactively, so load the wheel-discovered paths.
+ENV BASH_ENV=/etc/rocm_env.sh
 
 # Install MNIST test data
 FROM base as mnist
