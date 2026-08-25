@@ -553,8 +553,21 @@ class ConstDictVariable(VariableTracker):
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
         self.install_dict_keys_match_guard()
-        return self.clone(
-            items=self.items.copy(), mutation_type=ValueMutationNew(), source=None
+        # For a dict subclass, dict.copy() returns a plain dict; clone the base
+        # _base_vt view rather than the UserDefined* object itself, whose __dict__
+        # carries fields (e.g. _looked_up_attrs) that VariableTracker.__init__
+        # would reject.
+        base = (
+            self._base_vt
+            if isinstance(self, variables.UserDefinedObjectVariable)
+            else self
+        )
+        if base is None:
+            raise AssertionError("_base_vt must not be None")
+        return base.clone(
+            items=base.items.copy(),  # type: ignore[missing-attribute]
+            mutation_type=ValueMutationNew(),
+            source=None,
         )
 
     def dict_get(
@@ -837,18 +850,17 @@ class ConstDictVariable(VariableTracker):
 
         if op not in ("__eq__", "__ne__"):
             return ConstantVariable.create(NotImplemented)
-        if not isinstance(other, ConstDictVariable):
-            # Unwrap UserDefinedDictVariable to its base ConstDictVariable.
-            # This is correct because CPython's dict_equal operates on the
-            # internal C struct directly (ma_used, dk_entries, _Py_dict_lookup)
-            # -- it never calls __getitem__ or __len__ on dict subclasses.
-            # https://github.com/python/cpython/blob/e76aa128fe/Objects/dictobject.c#L4125-L4185
-            if isinstance(other, UserDefinedDictVariable):
-                if other._base_vt is None:
-                    raise AssertionError("expected _base_vt to be set")
-                other = other._base_vt
-            else:
-                return ConstantVariable.create(NotImplemented)
+        # Unwrap UserDefinedDictVariable to its base ConstDictVariable.
+        # This is correct because CPython's dict_equal operates on the
+        # internal C struct directly (ma_used, dk_entries, _Py_dict_lookup)
+        # -- it never calls __getitem__ or __len__ on dict subclasses.
+        # https://github.com/python/cpython/blob/e76aa128fe/Objects/dictobject.c#L4125-L4185
+        if isinstance(other, UserDefinedDictVariable):
+            if other._base_vt is None:
+                raise AssertionError("expected _base_vt to be set")
+            other = other._base_vt
+        elif not isinstance(other, ConstDictVariable):
+            return ConstantVariable.create(NotImplemented)
         eq_result = SourcelessBuilder.create(tx, polyfills.dict___eq__).call_function(
             tx, [self, other], {}
         )
