@@ -11,6 +11,7 @@ from torch.testing._internal.common_device_type import (
     instantiate_device_type_tests,
     onlyAccelerator,
     onlyCUDA,
+    skipCUDAIfNotRocm,
     skipXPUIf,
 )
 from torch.testing._internal.common_utils import (
@@ -92,10 +93,8 @@ class TestBmmOuterProductDevice(TestCase):
         self.assertEqual(torch.bmm(a, b), a @ b)
 
     @onlyCUDA
+    @skipCUDAIfNotRocm
     def test_hip_grid_limit_fallback(self, device):
-        if torch.version.hip is None:
-            self.skipTest("ROCm only")
-
         from torch._native.ops.bmm_outer_product.triton_kernels import (
             _BMM_OUTER_PRODUCT_NUM_WARPS,
         )
