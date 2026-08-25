@@ -7,10 +7,16 @@ from torch._native.instrumentation import instrumented_triton_cache
 from ...triton import ConstTensorWrapper
 
 
-def _bmm_log_key(a, b, out, B, M, N, *strides, BLOCK_M, BLOCK_N) -> str:
+_BMM_OUTER_PRODUCT_NUM_WARPS = 4
+
+
+def _bmm_log_key(a, b, out, B, M, N, *strides, BLOCK_M, BLOCK_N, num_warps) -> str:
     # Receives the kernel's launch args; BLOCK_M/BLOCK_N are the constexprs
     # that (with shapes/dtype) form the Triton compile key.
-    return f"bmm_outer B={B} M={M} N={N} {a.dtype} BLOCK_M={BLOCK_M} BLOCK_N={BLOCK_N}"
+    return (
+        f"bmm_outer B={B} M={M} N={N} {a.dtype} "
+        f"BLOCK_M={BLOCK_M} BLOCK_N={BLOCK_N} num_warps={num_warps}"
+    )
 
 
 @instrumented_triton_cache("aten::bmm", key_fn=_bmm_log_key)
@@ -74,17 +80,25 @@ def _pick_block_sizes(m: int, n: int) -> tuple[int, int]:
     return block_m, min(triton.next_power_of_2(n), 128)
 
 
+def _bmm_outer_product_launch_config(
+    batch: int, m: int, n: int
+) -> tuple[int, int, int]:
+    block_m, block_n = _pick_block_sizes(m, n)
+    num_programs = batch * triton.cdiv(m, block_m) * triton.cdiv(n, block_n)
+    return num_programs, block_m, block_n
+
+
 def bmm_outer_product(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     B, M, _ = a.shape
     N = b.shape[2]
 
     out = torch.empty(B, M, N, dtype=a.dtype, device=a.device)
 
-    BLOCK_M, BLOCK_N = _pick_block_sizes(M, N)
+    num_programs, BLOCK_M, BLOCK_N = _bmm_outer_product_launch_config(B, M, N)
 
     # a and b are read-only inputs; wrap them so a copy-on-write tensor is read
     # through const_data_ptr() and not materialized. out is written directly.
-    _bmm_outer_product_kernel[(B * triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),)](
+    _bmm_outer_product_kernel[(num_programs,)](
         ConstTensorWrapper(a),
         ConstTensorWrapper(b),
         out,
@@ -100,5 +114,6 @@ def bmm_outer_product(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         out.stride(2),
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
+        num_warps=_BMM_OUTER_PRODUCT_NUM_WARPS,
     )
     return out

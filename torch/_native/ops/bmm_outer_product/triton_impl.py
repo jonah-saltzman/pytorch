@@ -1,4 +1,5 @@
 import torch
+from torch.utils._triton import HIP_MAX_LAUNCH_THREADS
 
 from ... import triton_utils as tu
 
@@ -32,6 +33,31 @@ def _is_acc_tensor(t: torch.Tensor) -> bool:
     return acc is not None and acc.type == t.device.type
 
 
+def _is_hip_grid_safe(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """Return whether the outer-product BMM launch is safe on this backend.
+
+    Non-HIP backends always return ``True``. Unlike Inductor, this eager kernel
+    does not retune its fixed launch configuration, so oversized HIP launches
+    decline the specialization and let ATen handle the operation instead.
+    """
+    if torch.version.hip is None:
+        return True
+
+    from .triton_kernels import (
+        _bmm_outer_product_launch_config,
+        _BMM_OUTER_PRODUCT_NUM_WARPS,
+    )
+
+    batch, m, _ = a.shape
+    n = b.shape[2]
+    num_programs, _, _ = _bmm_outer_product_launch_config(batch, m, n)
+    warp_size = torch.cuda.get_device_properties(a.device).warp_size
+    return (
+        num_programs * _BMM_OUTER_PRODUCT_NUM_WARPS * warp_size
+        <= HIP_MAX_LAUNCH_THREADS
+    )
+
+
 def _bmm_outer_product_cond(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -41,7 +67,12 @@ def _bmm_outer_product_cond(
     # a and b are read-only here: the kernel wraps them in ConstTensorWrapper and
     # reads through const_data_ptr(), so copy-on-write inputs are not
     # materialized and need not be excluded.
-    if _is_acc_tensor(a) and a.device == b.device and _is_outer_product(a, b):
+    if (
+        _is_acc_tensor(a)
+        and a.device == b.device
+        and _is_outer_product(a, b)
+        and _is_hip_grid_safe(a, b)
+    ):
         return True
     return False
 

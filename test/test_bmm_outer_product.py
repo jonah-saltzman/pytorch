@@ -3,12 +3,14 @@
 import torch
 from torch._native.ops.bmm_outer_product.triton_impl import (
     _bmm_outer_product_cond,
+    _is_hip_grid_safe,
     _is_outer_product,
 )
 from torch.testing._internal.common_device_type import (
     deviceCountAtLeast,
     instantiate_device_type_tests,
     onlyAccelerator,
+    onlyCUDA,
     skipXPUIf,
 )
 from torch.testing._internal.common_utils import (
@@ -16,6 +18,7 @@ from torch.testing._internal.common_utils import (
     run_tests,
     TestCase,
 )
+from torch.utils._triton import HIP_MAX_LAUNCH_THREADS
 
 
 class TestBmmOuterProductDevice(TestCase):
@@ -87,6 +90,34 @@ class TestBmmOuterProductDevice(TestCase):
         a = torch.randn(8, 1, 1, device=device)
         b = torch.randn(8, 1, 1, device=device)
         self.assertEqual(torch.bmm(a, b), a @ b)
+
+    @onlyCUDA
+    def test_hip_grid_limit_fallback(self, device):
+        if torch.version.hip is None:
+            self.skipTest("ROCm only")
+
+        from torch._native.ops.bmm_outer_product.triton_kernels import (
+            _BMM_OUTER_PRODUCT_NUM_WARPS,
+        )
+
+        warp_size = torch.cuda.get_device_properties(device).warp_size
+        threads_per_program = _BMM_OUTER_PRODUCT_NUM_WARPS * warp_size
+        batch = HIP_MAX_LAUNCH_THREADS // threads_per_program + 1
+        self.assertLessEqual((batch - 1) * threads_per_program, HIP_MAX_LAUNCH_THREADS)
+        self.assertGreater(batch * threads_per_program, HIP_MAX_LAUNCH_THREADS)
+
+        a_base = torch.randn(1, 1, 1, device=device)
+        b_base = torch.randn(1, 1, 1, device=device)
+        a = a_base.expand(batch, -1, -1)
+        b = b_base.expand(batch, -1, -1)
+
+        self.assertFalse(_is_hip_grid_safe(a, b))
+        self.assertFalse(_bmm_outer_product_cond(a, b))
+
+        out = torch.bmm(a, b)
+        self.assertEqual(out.shape, (batch, 1, 1))
+        self.assertEqual(out[0], a_base[0] @ b_base[0])
+        self.assertEqual(out[-1], a_base[0] @ b_base[0])
 
     @onlyAccelerator
     def test_gradient_flow(self, device):
