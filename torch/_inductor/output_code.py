@@ -874,12 +874,24 @@ class CompiledFxGraph(OutputCode):
             return
 
         set_tracing_context_output_strides(example_inputs, self)
-        if graph_kwargs["cudagraphs"] is None:
-            raise AssertionError("graph_kwargs['cudagraphs'] must not be None")
         if graph_kwargs["is_backward"] is None:
             raise AssertionError("graph_kwargs['is_backward'] must not be None")
         is_backward = graph_kwargs["is_backward"]
-        cudagraphs: BoxedBool = graph_kwargs["cudagraphs"]
+        # A backward-only opt-out is serialized with this FX graph so
+        # AOTAutograd cache hits do not reuse the forward-derived decision.
+        cudagraphs_post_compile_override = self.fx_kwargs.get(
+            "cudagraphs_post_compile_override"
+        )
+        if cudagraphs_post_compile_override is not None:
+            if cudagraphs_post_compile_override:
+                raise AssertionError(
+                    "cudagraphs_post_compile_override only supports False"
+                )
+            graph_cudagraphs = BoxedBool(False)
+        else:
+            if graph_kwargs["cudagraphs"] is None:
+                raise AssertionError("graph_kwargs['cudagraphs'] must not be None")
+            graph_cudagraphs = graph_kwargs["cudagraphs"]
 
         # When a CUDAGraphPolicy is set and it says not to wrap this
         # inner CompiledFxGraph (e.g. because wrapping happens at the
@@ -889,9 +901,9 @@ class CompiledFxGraph(OutputCode):
         policy = config.cudagraph_policy
         if policy is not None and not policy.should_wrap(self):
             counters["inductor"]["cudagraph_skips"] += 1
-            BoxedBool.disable(cudagraphs)
+            BoxedBool.disable(graph_cudagraphs)
 
-        if cudagraphs:
+        if graph_cudagraphs:
             # It's possible that cudagraphs is enabled, but was disabled
             # during a previous compilation we're loading from the cache.
             # If so, we need to disable it on this new process too.
@@ -902,7 +914,7 @@ class CompiledFxGraph(OutputCode):
                     )
                 else:
                     counters["inductor"]["cudagraph_skips"] += 1
-                BoxedBool.disable(cudagraphs)
+                BoxedBool.disable(graph_cudagraphs)
             else:
                 if is_backward:
                     if "boxed_forward_device_index" not in graph_kwargs:
@@ -922,13 +934,13 @@ class CompiledFxGraph(OutputCode):
                 if config.graph_partition and policy is None:
                     # With graph_partition=True, we skip some cudagraph checks
                     # if it's supported with partition, so we use
-                    # cudagraph_partition_post_compile.  When a CUDAGraphPolicy
-                    # is active, we use cudagraph_post_compile instead so the
+                    # cudagraph_partition_post_compile. When a CUDAGraphPolicy
+                    # is active, use cudagraph_post_compile instead so the
                     # policy controls wrapping via policy.cudagraphify().
                     cudagraph_partition_post_compile(
                         example_inputs,
                         self,
-                        cudagraphs,
+                        graph_cudagraphs,
                         constants.unwrap(self),
                         boxed_forward_device_index,
                     )
@@ -936,15 +948,15 @@ class CompiledFxGraph(OutputCode):
                     cudagraph_post_compile(
                         example_inputs,
                         self,
-                        cudagraphs,
+                        graph_cudagraphs,
                         constants.unwrap(self),
                         boxed_forward_device_index,
                     )
         inputs_to_check = self.inputs_to_check
-        # cudagraphs could have been disabled from the earlier conditions
+        # graph_cudagraphs could have been disabled by the earlier conditions,
         # so we still need to realign inputs if that happens
         maybe_realign_inputs(
-            cudagraphs,
+            graph_cudagraphs,
             self,
             inputs_to_check,
             self.mutated_input_idxs,
