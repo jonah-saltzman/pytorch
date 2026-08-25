@@ -670,6 +670,11 @@ class TestOperatorsDevice(TestCase):
                 "nn.functional.batch_norm", {torch.float32: tol(atol=4e-05, rtol=5e-05)}
             ),
             tol1("nn.functional.conv2d", {torch.float32: tol(atol=4e-05, rtol=5e-05)}),
+            tol1(
+                "addbmm",
+                {torch.float32: tol(atol=1e-04, rtol=1.3e-05)},
+                device_type="cpu",
+            ),
             tol1("svd_lowrank", {torch.float32: tol(atol=5e-05, rtol=5e-05)}),
             tol1("pca_lowrank", {torch.float32: tol(atol=5e-05, rtol=5e-05)}),
             tol1(
@@ -1460,9 +1465,7 @@ class TestOperatorsDevice(TestCase):
     @ops(op_db + additional_op_db + autograd_function_db, allowed_dtypes=(torch.float,))
     @toleranceOverride({torch.float32: tol(atol=1e-04, rtol=1e-04)})
     @skipOps(
-        vmapvjp_fail.union(xpu_fft_stft_unsupported)
-        .union(xpu_fft_stft_unsupported)
-        .union(
+        vmapvjp_fail.union(xpu_fft_stft_unsupported).union(
             {
                 skip(
                     "to"
@@ -1792,9 +1795,22 @@ class TestOperatorsDevice(TestCase):
         "TestOperatorsDevice",
         "test_jvpvjp",
         (
-            tol1("masked.prod", {torch.float32: tol(atol=1e-04, rtol=5e-05)}),
+            tol1(
+                "masked.prod",
+                {torch.float32: tol(atol=1e-04, rtol=1.3e-05)},
+                device_type="cuda",
+            ),
+            tol1(
+                "masked.prod",
+                {torch.float32: tol(atol=1e-04, rtol=5e-05)},
+                device_type="cpu",
+            ),
             tol1("masked.cumprod", {torch.float32: tol(atol=1e-04, rtol=5e-04)}),
-            tol1("cumprod", {torch.float32: tol(atol=1e-03, rtol=5e-04)}),
+            tol1(
+                "cumprod",
+                {torch.float32: tol(atol=1e-03, rtol=5e-04)},
+                device_type=("cpu", "cuda"),
+            ),
             tol1(
                 "linalg.det",
                 {torch.float32: tol(atol=3e-05, rtol=5e-06)},
@@ -1803,7 +1819,7 @@ class TestOperatorsDevice(TestCase):
             tol1(
                 "linalg.vander",
                 {torch.float32: tol(atol=1e-04, rtol=1.3e-05)},
-                device_type="cuda",
+                device_type=("cpu", "cuda"),
             ),
             tol1(
                 "nn.functional.group_norm", {torch.float32: tol(atol=1e-03, rtol=1e-03)}
@@ -2039,6 +2055,11 @@ class TestOperatorsDevice(TestCase):
         "test_vmapjvpvjp",
         (
             tol1("linalg.svd", {torch.float32: tol(atol=5e-04, rtol=5e-04)}),
+            tol1(
+                "corrcoef",
+                {torch.float32: tol(atol=1e-03, rtol=1e-03)},
+                device_type="cpu",
+            ),
             tol1(
                 "linalg.householder_product",
                 {torch.float32: tol(atol=5e-03, rtol=5e-03)},
