@@ -38,7 +38,11 @@ from torch._inductor.config import triton as inductor_triton_config
 from torch._prims_common import compute_required_storage_length
 from torch.utils._debug_mode import get_active_debug_mode
 from torch.utils._ordered_set import OrderedSet
-from torch.utils._triton import get_triton_version, has_triton_stable_tma_api
+from torch.utils._triton import (
+    get_triton_version,
+    has_triton_stable_tma_api,
+    HIP_MAX_LAUNCH_THREADS,
+)
 
 from ..triton_bundler import TritonBundler
 from ..utils import (
@@ -3791,15 +3795,15 @@ def _num_warps(
 
 
 def _check_max_grid_x(size_hints, x, num_warps, *, warp_size: int = 32):
-    # Check if maxGridSize is exceeded - if so then must scale XBLOCK further
-    max_grid_x = 2147483647
+    # Scale XBLOCK until the backend's launch limit is satisfied.
+    cuda_max_grid_x = (1 << 31) - 1
     max_block_x = TRITON_MAX_BLOCK["X"]
     num_blocks = (size_hints["x"] + x - 1) // x
 
     if torch.version.hip:
         # HIP has a 2^31-1 limit on total threads (num_blocks * num_warps * warp_size)
         while (
-            (num_blocks * num_warps * warp_size) > max_grid_x
+            (num_blocks * num_warps * warp_size) > HIP_MAX_LAUNCH_THREADS
             and x < size_hints["x"]
             and x < max_block_x
         ):
@@ -3807,11 +3811,19 @@ def _check_max_grid_x(size_hints, x, num_warps, *, warp_size: int = 32):
             num_blocks = num_blocks // 2
     else:
         # NVIDIA has a 2^31-1 limit on number of blocks in grid (not total threads)
-        while num_blocks > max_grid_x and x < size_hints["x"] and x < max_block_x:
+        while num_blocks > cuda_max_grid_x and x < size_hints["x"] and x < max_block_x:
             x *= 2
             num_blocks = num_blocks // 2
 
-    if num_blocks > max_grid_x:
+    if (
+        torch.version.hip
+        and (num_blocks * num_warps * warp_size) > HIP_MAX_LAUNCH_THREADS
+    ):
+        raise AssertionError(
+            "Reduction config exceeds HIP total launch thread limit. "
+            "Please raise a pytorch issue"
+        )
+    if not torch.version.hip and num_blocks > cuda_max_grid_x:
         raise AssertionError(
             "Reduction config exceeds cudaDeviceProp maxGridSize. Please raise a pytorch issue"
         )
