@@ -15,20 +15,25 @@ that computes the wrong thing.
 With ``tracer="dynamo"``, precompile executes every tuple in ``example_inputs`` and
 captures the guarded specializations, recompilations, and graph-break resume frames
 Dynamo produces. Closure-free functions wrapped with ``torch._dynamo.disable`` are
-embedded for eager execution between compiled segments. Guards derived from runtime
-locals are retained for dispatch; guards covering the Python environment may be dropped
-because that environment is a caller-provided invariant. The artifact never compiles
-after loading; a call that fails every retained guard set raises. Compiled graphs and
-kernels remain Python source, while guard trees, transformed entry/resume bytecode, and
-disabled-function bytecode are stored as opaque inline data. Entry and resume frames
-dispatch directly from the generated source. Captured nested frames that are reachable
-only by an ordinary Python call use an isolated installed mode, which installs lazily
-and can be removed with ``unload()``.
+embedded for eager execution between compiled segments. The serialized guard records
+are filtered under the input-only recompilation contract while preserving how every
+example dispatches among the captured variants. The Python environment, including
+semantically unchanged at runtime; guards that only enforce that promise may be omitted,
+including guards through process-local values that cannot be reconstructed. By default,
+every portable input-derived guard is retained, rebuilt from frozen capture state, and
+checked for predicate drift. A standalone artifact raises when no captured variant matches.
+Captured nested frames that are reachable only by an ordinary Python call use an isolated
+installed mode; loading prepares it, the first call installs it, and an uncovered call
+may compile with the selected backend. ``serve_time_compiles()`` reports those compiles,
+and ``unload()`` removes the installation. Compiled graph bodies and kernels remain Python
+source. Eager higher-order ops retain opaque FX structure only where their runtime
+interpreters require a real ``Graph``; guard trees and transformed/disabled bytecode are
+also stored as opaque inline data.
 
-With ``tracer="dynamo", training=True`` (inductor backend only), every compiled segment
-contains AOTAutograd's forward and backward as readable Inductor source. The served
-output retains its ``grad_fn`` and a later ``backward()`` executes those captured
-backward kernels, including across captured recompilations and graph breaks.
+With ``tracer="dynamo", training=True``, captured graphs remain differentiable on both
+backends. Inductor artifacts contain AOTAutograd's forward and backward as readable
+source. The served output retains its ``grad_fn`` and a later ``backward()`` executes
+the captured backward, including across captured recompilations and graph breaks.
 
 ``precompile`` returns an executable ``python_code`` string plus a companion
 integrity-tagged ``cache``. Make-fx artifacts are self-contained. Dynamo artifacts may
@@ -221,19 +226,30 @@ it.
 #
 # tracer: the capture front-end, orthogonal to backend. "make_fx" (default) is a
 # non-strict trace. "dynamo" analyzes Python bytecode, captures one variant per
-# specialization/recompilation exercised by example_inputs, minimizes guard records
-# while preserving dispatch for those calls, and dispatches among the variants at
-# runtime. Graph breaks are reconstructed from their captured resume frames.
+# specialization/recompilation exercised by example_inputs, omits guards for the
+# caller-promised invariant environment, and retains every portable input-derived
+# guard. Graph breaks are reconstructed from their captured resume frames. The eager
+# backend preserves higher-order graph bodies as Python plus the opaque FX structure
+# their runtime interpreters require; it does not symbolically retrace them at load.
 
 from __future__ import annotations
 
 import dataclasses
+import dis
 import hashlib
 import io
+import itertools
 import logging
+import os
+import re
+import sys
 import threading
+import types
+import weakref
+from collections.abc import Callable, Mapping, Sequence
 from types import CodeType, MappingProxyType
 from typing import Any, cast, NewType, TYPE_CHECKING
+from typing_extensions import Self
 
 import torch
 import torch.utils._pytree as pytree
@@ -246,6 +262,9 @@ from torch.compiler._precompile_types import (
     _DynamoInputContract,
     _DynamoInputContractVariant,
     ExampleInput,
+    FrameInvariants,
+    GuardFact,
+    PrecompileSummary,
 )
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.nn.utils import stateless
@@ -256,9 +275,6 @@ log = logging.getLogger(__name__)
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping, Sequence
-    from typing_extensions import Self
-
     from torch._subclasses.fake_tensor import FakeTensorMode
 
 
@@ -804,8 +820,18 @@ def _capture(
         if isinstance(a, torch.Tensor):
             a.grad = None
     fake_mode = None
+    shape_env = None
+    initial_runtime_asserts: set[Any] = set()
     if any(marks):
         flat_args, fake_mode = _fakeify_with_unbacked(pb_flat, user_flat, marks)
+        shape_env = fake_mode.shape_env
+        if shape_env is None:
+            raise AssertionError("mark_unbacked capture requires a ShapeEnv")
+        initial_runtime_asserts = {
+            runtime_assert.expr
+            for assertions in shape_env.deferred_runtime_asserts.values()
+            for runtime_assert in assertions
+        }
         user_input_shapes = [
             None
             if base is None
@@ -915,6 +941,23 @@ def _capture(
         for a, g in zip(real_flat, saved_grads):
             if isinstance(a, torch.Tensor):
                 a.grad = g
+    if shape_env is not None:
+        added_runtime_asserts = sorted(
+            {
+                str(runtime_assert.expr)
+                for assertions in shape_env.deferred_runtime_asserts.values()
+                for runtime_assert in assertions
+                if runtime_assert.expr not in initial_runtime_asserts
+            }
+        )
+        if added_runtime_asserts:
+            raise PrecompileError(
+                "precompile: fn introduced deferred runtime shape constraints that the "
+                "standalone driver cannot enforce yet: "
+                f"{added_runtime_asserts}. Rewrite fn to avoid the deferred constraint. "
+                "For equality constraints between input dimensions, give those "
+                "dimensions a shared shape_id or capture them static."
+            )
     _check_no_constant_tensors(gm)
     _assert_no_control_flow_subgraphs(gm)
     _assert_supported(gm)
@@ -1031,6 +1074,8 @@ _GENERATED_HEADER = """\
 
 
 def _build_metadata_section(compiled: PrecompiledModule) -> list[str]:
+    from torch._dynamo.graph_utils import _graph_device_types
+
     if compiled._out_spec is None or compiled._in_spec is None:
         raise PrecompileError("internal: cannot build metadata before _compile()")
     # OUT_SPEC is load-bearing: the driver rebuilds fn's output via tree_unflatten, so
@@ -1059,6 +1104,11 @@ def _build_metadata_section(compiled: PrecompiledModule) -> list[str]:
         in_spec_str: str | None = pytree.treespec_dumps(compiled._in_spec)
     except (NotImplementedError, TypeError):
         in_spec_str = None
+    graph_devices = (
+        ()
+        if compiled._gm is None
+        else tuple(sorted(_graph_device_types(compiled._gm.graph)))
+    )
     parts = [
         "# " + "=" * 70,
         "# 2. Calling-convention metadata",
@@ -1100,6 +1150,7 @@ def _build_metadata_section(compiled: PrecompiledModule) -> list[str]:
         f"USER_INPUT_SHAPES = {compiled._user_input_shapes!r}",
         f"USER_INPUT_DTYPES = {compiled._user_input_dtypes!r}",
         f"USER_INPUT_DEVICES = {compiled._user_input_devices!r}",
+        f"GRAPH_DEVICES = {graph_devices!r}",
         # Per user-input-leaf mark_unbacked min/max bounds: None for a leaf with no bounded
         # marked dim, else {dim: (lo, hi)} (either may be None). The drivers reject a
         # runtime size outside the declared range (invariant 3); see the inlined drivers.
@@ -1145,6 +1196,11 @@ def _parse_artifact_metadata(python_code: str) -> dict[str, object]:
         "TRAINING",
         "SERVING_MODE",
         "UNREACHABLE_WITHOUT_INSTALL",
+        "CAPTURE_COMPLETE",
+        "DROPPED_GUARDS",
+        "RISKY_DROPPED_GUARDS",
+        "POLICY_DROPPED_GUARDS",
+        "WONT_GENERALIZE",
         *make_fx_metadata,
     }
     found: dict[str, object] = {}
@@ -1302,6 +1358,7 @@ def _emit_driver_source(forward_fn_name: str) -> str:
         inspect.getsource(driver._extract_param_buffers),
         inspect.getsource(driver._fail),
         inspect.getsource(driver._check_structure),
+        inspect.getsource(driver._autocast_off),
         inspect.getsource(forward_fn).replace(
             f"def {forward_fn_name}(", "def forward(", 1
         ),
@@ -1366,28 +1423,124 @@ class _DynamoPythonBackend:
 
 def _build_dynamo_eager_graph_source(gm: torch.fx.GraphModule) -> str:
     """Render one Dynamo FX graph as standalone eager Python source."""
-    get_attrs = list(gm.graph.find_nodes(op="get_attr"))
-    if get_attrs:
-        raise PrecompileError(
-            "precompile tracer='dynamo' with backend='eager' does not yet support "
-            "FX get_attr nodes; use backend='inductor'."
+    import base64
+    import pickle
+
+    from torch.fx._graph_pickler import GraphPickler, Options
+    from torch.fx._lazy_graph_module import _LazyGraphModule
+    from torch.fx.graph_module import _format_import_block
+    from torch.package import sys_importer
+
+    def recompile(module: torch.fx.GraphModule) -> Any:
+        return (
+            module._real_recompile()
+            if isinstance(module, _LazyGraphModule)
+            else module.recompile()
         )
+
+    options = Options(
+        ops_filter=None,
+        node_metadata_key_filter=lambda key: key
+        not in (
+            "example_value",
+            "tensor_dict",
+            "source_fn_stack",
+            "nn_module_stack",
+            "fwd_source_fn_stack",
+        ),
+    )
+    python_code = recompile(gm)
+    readable_subgraphs: list[tuple[str, str, str]] = []
+
+    def collect_subgraphs(module: torch.fx.GraphModule, prefix: str = "") -> None:
+        for name, child in module._modules.items():
+            if not isinstance(child, torch.fx.GraphModule):
+                continue
+            path = f"{prefix}.{name}" if prefix else name
+            child_code = recompile(child)
+            readable_subgraphs.append(
+                (
+                    path,
+                    _format_import_block(child_code.globals, sys_importer),
+                    child.code,
+                )
+            )
+            collect_subgraphs(child, path)
+
+    collect_subgraphs(gm)
+    body = gm.__dict__.copy()
+    body.pop("_graph", None)
+    marker = "torch.compiler.precompile.eager_subgraph"
+    body["_modules"] = {
+        name: (marker, GraphPickler.dumps(module, options))
+        if isinstance(module, torch.fx.GraphModule)
+        else module
+        for name, module in body.get("_modules", {}).items()
+    }
+    encoded_body = base64.b64encode(pickle.dumps(body)).decode("ascii")
+    import_block = _format_import_block(python_code.globals, sys_importer)
 
     from torch.fx.graph import _custom_builtins
 
     parts = [
         "# Dynamo captured graph (eager backend).",
+        "import base64",
+        "import pickle",
+        "import torch",
+        "from torch._subclasses import FakeTensorMode",
+        "from torch.fx._graph_pickler import GraphPickler",
+        "from torch.fx.experimental.symbolic_shapes import ShapeEnv",
         *(_cb.import_str for _cb in _custom_builtins.values()),
-        gm.code.replace("def forward(", "def _graph_forward(", 1),
-        "",
-        "class _GraphSelf:",
-        "    pass",
-        "",
-        "",
-        "def call(args):",
-        "    return _graph_forward(_GraphSelf(), *args)",
-        "",
+        import_block,
     ]
+    for index, (path, imports, source) in enumerate(readable_subgraphs):
+        parts.extend(
+            [
+                f"# Nested FX graph {path!r}; executable structure is restored below.",
+                imports,
+                source.replace("def forward(", f"def _eager_subgraph_{index}(", 1),
+                "",
+            ]
+        )
+    parts.extend(
+        [
+            gm.code.replace("def forward(", "def _graph_forward(", 1),
+            "",
+            "# Opaque FX state: eager HOPs require real Graph objects at runtime.",
+            f"_EAGER_GRAPH_BODY = {encoded_body!r}",
+            f"_EAGER_SUBGRAPH_MARKER = {marker!r}",
+            "",
+            "",
+            "def _load_eager_subgraph(value):",
+            "    if not (isinstance(value, tuple) and len(value) == 2 and",
+            "            value[0] == _EAGER_SUBGRAPH_MARKER):",
+            "        return value",
+            "    graph = GraphPickler.loads(",
+            "        value[1], FakeTensorMode(shape_env=ShapeEnv())",
+            "    )",
+            "    graph.recompile()",
+            "    return graph",
+            "",
+            "",
+            "class _GraphSelf(torch.nn.Module):",
+            "    def __init__(self):",
+            "        super().__init__()",
+            "        body = pickle.loads(base64.b64decode(_EAGER_GRAPH_BODY))",
+            "        body['_modules'] = {",
+            "            name: _load_eager_subgraph(value)",
+            "            for name, value in body.get('_modules', {}).items()",
+            "        }",
+            "        self.__dict__.update(body)",
+            "",
+            "",
+            "_GRAPH_SELF = _GraphSelf()",
+            "",
+            "",
+            "def call(args):",
+            "    return _graph_forward(_GRAPH_SELF, *args)",
+            "",
+        ]
+    )
     return "\n".join(parts)
 
 
@@ -1429,29 +1582,299 @@ def _dynamo_backend_compiler(
     return compile_graph
 
 
+_DYNAMO_UNMODELLED_GUARD_TYPES = frozenset(
+    {
+        "DETERMINISTIC_ALGORITHMS",
+        "DISPATCH_KEY_SET_MATCH",
+        "DTENSOR_SPEC_MATCH",
+        "FSDP_TRAINING_STATE",
+        "GLOBAL_STATE",
+        "OPAQUE_OBJ_GUARD_FN_MATCH",
+        "SHAPE_ENV",
+        "TENSOR_SUBCLASS_METADATA_MATCH",
+        "TORCH_FUNCTION_STATE",
+    }
+)
+_DYNAMO_ENVIRONMENT_GUARD_TYPES = frozenset(
+    {
+        "AUTOGRAD_SAVED_TENSORS_HOOKS",
+        "DEFAULT_DEVICE",
+        "DETERMINISTIC_ALGORITHMS",
+        "GRAD_MODE",
+        "GLOBAL_STATE",
+        "TORCH_FUNCTION_STATE",
+    }
+)
+_DYNAMO_VALUE_GUARD_TYPES = frozenset({"CONSTANT_MATCH", "EQUALS_MATCH"})
+_DYNAMO_OBJ_ID = re.compile(r"(?<=, )\d+(?=\), type=)")
+_DYNAMO_SAVED_HOOK_IDS = re.compile(
+    r"(?<=top_saved_tensors_hooks ids == )\(\d+(?:, \d+)*\)"
+)
+_DYNAMO_COUNTER = re.compile(
+    r"(__builtins_dict__|__compiled_fn|__resume_at)_*\d+(_\d+)?"
+)
+_DYNAMO_GLOBAL_BY_ID = re.compile(r"_\d{9,}_c\d+\b")
+
+
+def _normalize_dynamo_guard_text(text: str) -> str:
+    text = _DYNAMO_SAVED_HOOK_IDS.sub("(<ids>)", text)
+    text = _DYNAMO_GLOBAL_BY_ID.sub("_<id>_c<n>", _DYNAMO_OBJ_ID.sub("<id>", text))
+    return _DYNAMO_COUNTER.sub(r"\1_<n>", text)
+
+
+def _stable_code_constants(constants: tuple[object, ...]) -> tuple[object, ...]:
+    stable = (str, int, float, complex, bytes, bool, type(None))
+    result: list[object] = []
+    for value in constants:
+        if isinstance(value, stable):
+            result.append(value)
+        elif isinstance(value, CodeType):
+            result.append(_dynamo_code_fingerprint(value))
+        elif isinstance(value, tuple):
+            result.append(_stable_code_constants(value))
+        elif isinstance(value, frozenset):
+            result.append(tuple(sorted(_stable_code_constants(tuple(value)), key=repr)))
+    return tuple(result)
+
+
+def _dynamo_code_fingerprint(code: CodeType) -> str:
+    data = (
+        code.co_code,
+        code.co_names,
+        code.co_varnames,
+        code.co_freevars,
+        code.co_cellvars,
+        _stable_code_constants(code.co_consts),
+    )
+    return hashlib.sha256(repr(data).encode()).hexdigest()[:12]
+
+
+def _dynamo_object_identity(value: object) -> str:
+    if isinstance(value, types.ModuleType):
+        return f"is module {value.__name__}"
+    name = getattr(value, "__qualname__", None) or getattr(value, "__name__", None)
+    if isinstance(name, str):
+        code = getattr(value, "__code__", None)
+        where = ""
+        if isinstance(code, CodeType):
+            site = os.path.basename(code.co_filename or "?")
+            where = f"@{site}:{code.co_firstlineno}#{_dynamo_code_fingerprint(code)} "
+        owner = getattr(value, "__module__", None) or "?"
+        return _normalize_dynamo_guard_text(f"is {where}{owner}.{name}")[:160]
+    return f"is a {type(value).__module__}.{type(value).__qualname__}"[:160]
+
+
+def _dynamo_guard_value(entry: Any) -> str:
+    if entry.guard_type == "AUTOGRAD_SAVED_TENSORS_HOOKS":
+        try:
+            from torch._functorch._aot_autograd.utils import top_saved_tensors_hooks
+
+            hooks = top_saved_tensors_hooks()
+        except Exception:
+            return ""
+        return "hooks=None" if not hooks else f"hooks={len(hooks)}"
+    if entry.guard_type == "GRAD_MODE":
+        return f"grad_enabled={torch.is_grad_enabled()}"
+    if not entry.has_value:
+        return ""
+    value = entry.value
+    if isinstance(value, torch.Tensor):
+        try:
+            from torch._dynamo.guards import (
+                convert_to_concrete_values,
+                get_tensor_guard_code_part,
+            )
+
+            pytype = getattr(value, "pytype", type(value))
+            is_python_fake = isinstance(  # noqa: ISINSTANCE_FAKE_TENSOR
+                value, torch._subclasses.FakeTensor
+            )
+            if is_python_fake and pytype is type(value):
+                pytype = torch.Tensor
+            dispatch_keys = getattr(value, "dispatch_keys", None)
+            if dispatch_keys is None:
+                dispatch_keys = torch._C._dispatch_keys(value)
+
+            return get_tensor_guard_code_part(
+                value,
+                "",
+                convert_to_concrete_values(value.size()),
+                convert_to_concrete_values(value.stride()),
+                pytype,
+                dispatch_keys,
+            )
+        except Exception:
+            return f"type={type(value).__name__}, dtype={value.dtype}, <unrenderable>"
+    unsupported = set(
+        torch._dynamo.guards.CheckFunctionManager.UNSUPPORTED_SERIALIZATION_GUARD_TYPES
+    )
+    if entry.guard_type in unsupported or unsupported.intersection(
+        entry.derived_guard_types
+    ):
+        return _dynamo_object_identity(value)
+    return ""
+
+
+def _dynamo_guard_fact(entry: Any, *, enforced: bool) -> GuardFact:
+    code = getattr(entry, "code", ()) or tuple(entry.orig_guard.code_list or ())
+    return GuardFact(
+        guard_type=entry.guard_type,
+        source=_normalize_dynamo_guard_text(entry.name),
+        code=tuple(_normalize_dynamo_guard_text(part) for part in code),
+        value=(
+            ""
+            if entry.guard_type in _DYNAMO_UNMODELLED_GUARD_TYPES
+            else _dynamo_guard_value(entry)
+        ),
+        enforced=enforced,
+    )
+
+
+def _dynamo_guard_slot(guard: Any) -> tuple[str, str]:
+    from torch._dynamo.guards import strip_local_scope
+
+    return (
+        guard.create_fn_name(),
+        _normalize_dynamo_guard_text(strip_local_scope(guard.name)),
+    )
+
+
+@dataclasses.dataclass(frozen=True)
+class _DynamoGuardFinalization:
+    states: tuple[bytes, ...]
+    kept_slots: tuple[frozenset[tuple[str, str]], ...]
+    policy_dropped: frozenset[tuple[str, str]]
+
+
+@dataclasses.dataclass(frozen=True)
+class _DynamoCapturedGuardSet:
+    facts: tuple[GuardFact, ...]
+    dropped: frozenset[tuple[str, str]]
+    risky_dropped: frozenset[tuple[str, str]]
+    environment: frozenset[tuple[str, str]]
+
+
+def _dynamo_frame_invariants(
+    code_entries: Sequence[Any],
+    captured: dict[int, list[_DynamoCapturedGuardSet]],
+    kept_by_entry: dict[int, list[frozenset[tuple[str, str]]]],
+) -> tuple[FrameInvariants, ...]:
+    from torch._dynamo.package import SerializedCode
+
+    result = []
+    for entry in code_entries:
+        code = SerializedCode.to_code_object(entry.python_code)
+        records = captured.get(id(entry), [])
+        final_slots = kept_by_entry.get(id(entry), [])
+        variants: list[frozenset[GuardFact]] = []
+        undetermined: set[GuardFact] = set()
+        for index, record in enumerate(records):
+            kept = final_slots[index] if index < len(final_slots) else frozenset()
+            facts = set()
+            for fact in record.facts:
+                enforced = fact.enforced and (fact.guard_type, fact.source) in kept
+                updated = dataclasses.replace(fact, enforced=enforced)
+                if fact.guard_type in _DYNAMO_UNMODELLED_GUARD_TYPES:
+                    undetermined.add(updated)
+                else:
+                    facts.add(updated)
+            variants.append(frozenset(facts))
+        shared = frozenset.intersection(*variants) if variants else frozenset()
+        every: set[GuardFact] = set()
+        for facts in variants:
+            every.update(facts)
+
+        def order(fact: GuardFact) -> tuple[str, str, str, str]:
+            return (
+                fact.source,
+                fact.guard_type,
+                " ".join(fact.code),
+                fact.value,
+            )
+
+        result.append(
+            FrameInvariants(
+                frame=code.co_name,
+                filename=code.co_filename,
+                lineno=code.co_firstlineno,
+                variants=len(entry.guarded_codes),
+                invariant=tuple(sorted(shared, key=order)),
+                varying=tuple(sorted(every - shared, key=order)),
+                undetermined=tuple(sorted(undetermined, key=order)),
+            )
+        )
+    return tuple(result)
+
+
+def _dynamo_wont_generalize(
+    kept: set[tuple[str, str]],
+) -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            {
+                source
+                for guard_type, source in kept
+                if guard_type in _DYNAMO_VALUE_GUARD_TYPES
+                and "." not in source
+                and "[" not in source
+            }
+        )
+    )
+
+
+def _write_dynamo_invariants(
+    path: str, target: Callable[..., object], frames: Sequence[FrameInvariants]
+) -> None:
+    from pathlib import Path
+
+    lines = [
+        f"# precompile invariants for {target.__module__}.{target.__qualname__}",
+        "# Generated from one execution of each supplied example.",
+        "",
+    ]
+    for frame in frames:
+        lines.extend(
+            [
+                f"[{frame.frame} at {frame.filename}:{frame.lineno}]",
+                f"variants = {frame.variants}",
+                "invariant:",
+                *([f"  {fact.render()}" for fact in frame.invariant] or ["  <none>"]),
+                "varying:",
+                *([f"  {fact.render()}" for fact in frame.varying] or ["  <none>"]),
+                "undetermined:",
+                *(
+                    [f"  {fact.render()}" for fact in frame.undetermined]
+                    or ["  <none>"]
+                ),
+                "",
+            ]
+        )
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text("\n".join(lines), encoding="utf-8")
+
+
 def _filter_dynamo_guards(
     target_code: CodeType,
     runtime_global_scope: dict[str, object],
     guarded_codes: Sequence[Any],
-    example_scopes: Sequence[dict[str, object]],
-) -> list[bytes]:
-    """Drop environment guards while preserving every local-derived guard."""
+    captured: Sequence[_DynamoCapturedGuardSet],
+    live_leaf_sets: Sequence[frozenset[tuple[str, str, str]]],
+) -> _DynamoGuardFinalization:
+    """Rebuild and validate guards from frozen capture state."""
     import dataclasses
     import functools
 
-    from torch._dynamo.guards import CheckFunctionManager, GuardBuilder
+    from torch._dynamo.guards import (
+        _companion_attribute_guards,
+        CheckFunctionManager,
+        GuardBuilder,
+        strip_local_scope,
+    )
     from torch._dynamo.output_graph import OutputGraphCommon
     from torch._dynamo.package import load_guard_manager, load_guards_state
     from torch._guards import GuardsSet
     from torch.utils._ordered_set import OrderedSet
-
-    local_roots = {f"L[{name!r}]" for scope in example_scopes for name in scope}
-
-    def is_local_source(source: str) -> bool:
-        return any(
-            source == root or source.startswith((f"{root}.", f"{root}["))
-            for root in local_roots
-        )
 
     def fresh_guard(guard: Any, *, final: bool = False) -> Any:
         create_fn = guard.create_fn
@@ -1476,83 +1899,43 @@ def _filter_dynamo_guards(
             state = dataclasses.replace(state, output_graph=output_graph)
         return load_guard_manager(state, target_code, runtime_global_scope)
 
-    def outcomes(
-        state: Any,
-        *,
-        guards: Sequence[Any],
-        aot_guards: Sequence[Any],
-        key_order: Sequence[Any],
-    ) -> list[bool]:
-        output_graph = dataclasses.replace(
-            state.output_graph,
-            _guards=GuardsSet(OrderedSet(fresh_guard(guard) for guard in guards)),
-            _aotautograd_guards=list(aot_guards),
-            guard_on_key_order=set(key_order),
-        )
-        manager = manager_for(state, output_graph)
-        return [manager.check(scope) for scope in example_scopes]
-
     states = [load_guards_state(guarded.guards_state) for guarded in guarded_codes]
+    if len(states) != len(captured):
+        raise PrecompileError(
+            "precompile tracer='dynamo' did not record one guard set for every "
+            "captured variant."
+        )
+    if len(states) != len(live_leaf_sets):
+        raise PrecompileError(
+            "precompile tracer='dynamo' did not record one live guard tree for "
+            "every captured variant."
+        )
     filtered_states: list[bytes] = []
-    for state in states:
-        kept_guards = list(state.output_graph.guards)
-        kept_aot_guards = list(state.output_graph.aotautograd_guards)
-        kept_key_order = sorted(
-            state.output_graph.guard_on_key_order, key=lambda source: source.name
-        )
-        baseline = outcomes(
-            state,
-            guards=kept_guards,
-            aot_guards=kept_aot_guards,
-            key_order=kept_key_order,
-        )
-        matching_scopes = [
-            scope
-            for scope, matches in zip(example_scopes, baseline, strict=True)
-            if matches
+    kept_slots: list[frozenset[tuple[str, str]]] = []
+    policy_dropped: set[tuple[str, str]] = set()
+    for state, record, live_leaves in zip(
+        states, captured, live_leaf_sets, strict=True
+    ):
+        live_facts: dict[tuple[str, str], set[GuardFact]] = {}
+        for fact in record.facts:
+            if fact.enforced:
+                live_facts.setdefault((fact.guard_type, fact.source), set()).add(fact)
+        kept_guards = [
+            guard
+            for guard in state.output_graph.guards
+            if _dynamo_guard_slot(guard) not in record.environment
         ]
-        if not matching_scopes:
-            raise PrecompileError(
-                "precompile tracer='dynamo' captured a variant that does not match "
-                "any example input."
-            )
-
-        def try_drop(records: list[Any], index: int) -> bool:
-            if records is kept_aot_guards or records is kept_key_order:
-                return False
-            guard = records[index]
-            if not guard.name or is_local_source(guard.name):
-                return False
-            candidate = records[:index] + records[index + 1 :]
-            trial_guards = candidate if records is kept_guards else kept_guards
-            trial_aot = candidate if records is kept_aot_guards else kept_aot_guards
-            trial_key_order = candidate if records is kept_key_order else kept_key_order
-            try:
-                return (
-                    outcomes(
-                        state,
-                        guards=trial_guards,
-                        aot_guards=trial_aot,
-                        key_order=trial_key_order,
-                    )
-                    == baseline
-                )
-            except Exception:
-                # Some records construct relational checks jointly. If removing one
-                # leaves an invalid manager, it is a required dependency.
-                return False
-
-        changed = True
-        while changed:
-            changed = False
-            for records in (kept_guards, kept_aot_guards, kept_key_order):
-                index = 0
-                while index < len(records):
-                    if try_drop(records, index):
-                        del records[index]
-                        changed = True
-                    else:
-                        index += 1
+        kept_aot_guards = list(state.output_graph.aotautograd_guards)
+        environment_sources = {source for _, source in record.environment}
+        kept_key_order = sorted(
+            (
+                source
+                for source in state.output_graph.guard_on_key_order
+                if _normalize_dynamo_guard_text(strip_local_scope(source.name))
+                not in environment_sources
+            ),
+            key=lambda source: source.name,
+        )
 
         output_graph = dataclasses.replace(
             state.output_graph,
@@ -1567,6 +1950,26 @@ def _filter_dynamo_guards(
             if any(guard.create_fn_name() == "SHAPE_ENV" for guard in kept_guards)
             else None
         )
+        failures: list[tuple[Any, Exception]] = []
+        drifted: list[tuple[Any, GuardFact]] = []
+
+        def keep_unchanged_guards(entries: Sequence[Any]) -> list[bool]:
+            for entry in entries:
+                fact = _dynamo_guard_fact(entry, enforced=True)
+                slot = (fact.guard_type, fact.source)
+                if fact not in live_facts.get(slot, set()):
+                    drifted.append((entry.orig_guard, fact))
+            companions = _companion_attribute_guards(
+                [entry.orig_guard for entry in entries],
+                [
+                    (guard, RuntimeError("the rebuilt guard changed"))
+                    for guard, _ in drifted
+                ],
+            )
+            dropped = {id(guard) for guard, _ in drifted}
+            dropped.update(id(guard) for guard, _ in companions)
+            return [id(entry.orig_guard) not in dropped for entry in entries]
+
         check_fn = CheckFunctionManager(
             target_code,
             OutputGraphCommon(output_graph),
@@ -1575,20 +1978,136 @@ def _filter_dynamo_guards(
             save_guards=True,
             strict_error=True,
             guard_build_local_state=state.local_state,
+            serialization_guard_filter_fn=keep_unchanged_guards,
+            collect_guard_failures=failures,
         )
+        failed_slots = {_dynamo_guard_slot(guard) for guard, _ in failures}
+        input_failures = failed_slots - record.environment
+        if input_failures:
+            guard, error = next(
+                (guard, error)
+                for guard, error in failures
+                if _dynamo_guard_slot(guard) in input_failures
+            )
+            raise PrecompileError(
+                "precompile tracer='dynamo' cannot rebuild input-derived guard "
+                f"{_dynamo_guard_slot(guard)!r}: {type(error).__name__}: {error}"
+            ) from error
+        input_drift = [
+            (guard, fact)
+            for guard, fact in drifted
+            if _dynamo_guard_slot(guard) not in record.environment
+        ]
+        if input_drift:
+            guard, fact = input_drift[0]
+            raise PrecompileError(
+                "precompile tracer='dynamo' rebuilt input-derived guard "
+                f"{_dynamo_guard_slot(guard)!r} with a changed predicate: "
+                f"{fact.render()}"
+            )
         if check_fn.guards_state is None:
             raise AssertionError("guards_state must not be None")
         filtered_state = load_guards_state(check_fn.guards_state)
-        filtered_manager = manager_for(filtered_state)
-        filtered_outcomes = [filtered_manager.check(scope) for scope in example_scopes]
-        if filtered_outcomes != baseline:
+        rebuilt = manager_for(filtered_state)
+        dropped_sources = {
+            source for _, source in record.environment | record.dropped if source
+        }
+        dropped_root_types = {
+            guard_type
+            for guard_type, source in record.environment | record.dropped
+            if not source
+        }
+        root_environment_types = {
+            "DEFAULT_DEVICE",
+            "GLOBAL_STATE",
+            "TORCH_FUNCTION_MODE_STACK",
+        }
+
+        def normalize_leaf(
+            leaf: tuple[str, str, str],
+        ) -> tuple[str, str, str]:
+            source, guard_type, payload = leaf
+            return (
+                _normalize_dynamo_guard_text(source),
+                guard_type,
+                _normalize_dynamo_guard_text(payload),
+            )
+
+        def is_dropped_leaf(leaf: tuple[str, str, str]) -> bool:
+            source, guard_type, payload = leaf
+            if not source:
+                return guard_type in root_environment_types or (
+                    guard_type == "LAMBDA_GUARD"
+                    and (
+                        "top_saved_tensors_hooks" in payload
+                        or "SHAPE_ENV" in dropped_root_types
+                    )
+                )
+            return any(
+                source == root or source.startswith((f"{root}.", f"{root}["))
+                for root in dropped_sources
+            )
+
+        normalized_live_leaves = map(normalize_leaf, live_leaves)
+        expected_leaves = frozenset(
+            leaf for leaf in normalized_live_leaves if not is_dropped_leaf(leaf)
+        )
+        rebuilt_leaves = frozenset(
+            normalize_leaf(leaf) for leaf in rebuilt.leaf_fingerprint()
+        )
+        changed_leaves = expected_leaves ^ rebuilt_leaves
+        if changed_leaves:
+            examples = ", ".join(
+                f"{source or '<root>'}: {guard_type}: {payload}"
+                for source, guard_type, payload in sorted(changed_leaves)[:3]
+            )
             raise PrecompileError(
-                "precompile tracer='dynamo' guard filtering changed captured "
-                "example dispatch."
+                "precompile tracer='dynamo' rebuilt a guard tree with changed "
+                f"input-derived checks: {examples}"
             )
         filtered_states.append(check_fn.guards_state)
+        final_slots = frozenset(
+            _dynamo_guard_slot(guard) for guard in filtered_state.output_graph.guards
+        )
+        kept_slots.append(final_slots)
+        policy_dropped.update(
+            {_dynamo_guard_slot(guard) for guard in state.output_graph.guards}
+            - final_slots
+        )
 
-    return filtered_states
+    facts_by_variant = [
+        {
+            slot: frozenset(
+                dataclasses.replace(fact, enforced=True)
+                for fact in record.facts
+                if (fact.guard_type, fact.source) == slot
+            )
+            for slot in {(fact.guard_type, fact.source) for fact in record.facts}
+        }
+        for record in captured
+    ]
+    for index, facts in enumerate(facts_by_variant):
+        for earlier in range(index):
+            if not any(
+                facts_by_variant[earlier].get(slot) != facts.get(slot)
+                for slot in kept_slots[earlier]
+            ):
+                differing = sorted(
+                    slot
+                    for slot in facts_by_variant[earlier].keys() | facts.keys()
+                    if facts_by_variant[earlier].get(slot) != facts.get(slot)
+                )
+                raise PrecompileError(
+                    "precompile tracer='dynamo' dropped guards that can affect "
+                    f"dispatch between captured variants {earlier} and {index}: "
+                    f"{differing}"
+                )
+
+    return _DynamoGuardFinalization(
+        states=tuple(filtered_states),
+        kept_slots=tuple(kept_slots),
+        policy_dropped=frozenset(policy_dropped),
+    )
 
 
 def _dynamo_code_names(code: CodeType) -> set[str]:
@@ -1597,6 +2116,19 @@ def _dynamo_code_names(code: CodeType) -> set[str]:
         if isinstance(const, CodeType):
             names.update(_dynamo_code_names(const))
     return names
+
+
+def _dynamo_code_writes_grad(code: CodeType) -> bool:
+    if any(
+        instruction.opname in ("STORE_ATTR", "DELETE_ATTR")
+        and instruction.argval == "grad"
+        for instruction in dis.get_instructions(code)
+    ):
+        return True
+    return any(
+        isinstance(constant, CodeType) and _dynamo_code_writes_grad(constant)
+        for constant in code.co_consts
+    )
 
 
 def _reachable_dynamo_frames(codes: Sequence[_DynamoCodeState]) -> set[int]:
@@ -1648,7 +2180,6 @@ def _build_dynamo_python_source(
     import base64
     import inspect
     import pickle
-    import sys
 
     from torch import _precompile_driver as driver
     from torch._functorch._aot_autograd.to_standalone_python import (
@@ -1665,6 +2196,7 @@ def _build_dynamo_python_source(
 
     dynamic_count = sum(compiled.is_dynamic for compiled in compiled_backends)
     variant_count = sum(len(code.variants) for code in state.codes)
+    summary = state.summary
     reachable = _reachable_dynamo_frames(state.codes)
     unreachable = tuple(
         code.code.co_name
@@ -1675,7 +2207,9 @@ def _build_dynamo_python_source(
         [
             "# This artifact installs captured entries into an isolated Dynamo cache",
             "# region on first call because ordinary Python calls make some captured",
-            "# frames unreachable from a standalone bytecode dispatcher. unload()",
+            "# frames unreachable from a standalone bytecode dispatcher. Loading",
+            "# prepares its backends and guards without installing them. An uncovered",
+            "# call compiles, warns, and increments serve_time_compiles(); unload()",
             "# removes only this artifact's entries and installed globals.",
         ]
         if state.serving_mode == "installed"
@@ -1687,9 +2221,9 @@ def _build_dynamo_python_source(
     parts = [
         '# Generated by torch.compiler.precompile (tracer="dynamo") -- do not edit.',
         "#",
-        "# The compiled graphs and kernels below are ordinary Python source. Dynamo's",
-        "# guard trees and required code objects have no source form, so section 2",
-        "# stores minimized dispatch guards and bytecode as base64-encoded pickle data.",
+        "# Graph entry points and kernels below are ordinary Python source. Nested FX",
+        "# graph structure used by eager higher-order ops, Dynamo guard trees, and",
+        "# required code objects are stored as labelled base64-encoded pickle data.",
         *serving_description,
         "",
         "# " + "=" * 70,
@@ -1704,7 +2238,15 @@ def _build_dynamo_python_source(
         f"DYNAMIC_GRAPH_COUNT = {dynamic_count}",
         f"SERVING_MODE = {state.serving_mode!r}",
         f"UNREACHABLE_WITHOUT_INSTALL = {unreachable!r}",
+        f"CAPTURE_COMPLETE = {summary.complete if summary is not None else True!r}",
+        f"DROPPED_GUARDS = {list(summary.dropped_guards) if summary else []!r}",
+        f"RISKY_DROPPED_GUARDS = "
+        f"{list(summary.risky_dropped_guards) if summary else []!r}",
+        f"POLICY_DROPPED_GUARDS = "
+        f"{list(summary.policy_dropped_guards) if summary else []!r}",
+        f"WONT_GENERALIZE = {summary.wont_generalize if summary else ()!r}",
         f"_DYNAMO_PYTHON_VERSION = {tuple(sys.version_info[:2])!r}",
+        f"_DYNAMO_TORCH_VERSION = {torch.__version__!r}",
         f"_DYNAMO_BACKEND_IDS = {tuple(backend_ids)!r}",
     ]
     namespaced_sources = namespace_module_names(
@@ -1840,13 +2382,31 @@ def _dynamo_input_contract(
             rank = cast("int | None", common(ranks))
             shapes = [tuple(tensor.shape) for tensor in tensors]
             strides = [tuple(tensor.stride()) for tensor in tensors]
+            marked_dims = set().union(
+                *(
+                    set(getattr(tensor, "_dynamo_unbacked_indices", None) or ())
+                    | set(
+                        getattr(tensor, "_dynamo_strict_unbacked_indices", None) or ()
+                    )
+                    for tensor in tensors
+                )
+            )
             shape = (
-                tuple(common([dims[dim] for dims in shapes]) for dim in range(rank))
+                tuple(
+                    None
+                    if dim in marked_dims
+                    else common([dims[dim] for dims in shapes])
+                    for dim in range(rank)
+                )
                 if rank is not None
                 else None
             )
             stride = (
-                tuple(common([dims[dim] for dims in strides]) for dim in range(rank))
+                None
+                if marked_dims
+                else tuple(
+                    common([dims[dim] for dims in strides]) for dim in range(rank)
+                )
                 if rank is not None
                 else None
             )
@@ -1869,6 +2429,88 @@ def _dynamo_input_contract(
     return _DynamoInputContract(tuple(variants))
 
 
+def _dynamo_input_object_ids(
+    fn: Callable[..., object], example_inputs: Sequence[ExampleInput]
+) -> set[int]:
+    stack = [
+        value
+        for example in example_inputs
+        for value in (*example.args, *example.kwargs.values())
+    ]
+    if isinstance(fn, types.FunctionType):
+        stack.extend(fn.__defaults__ or ())
+        stack.extend((fn.__kwdefaults__ or {}).values())
+    elif isinstance(fn, types.MethodType):
+        stack.extend(fn.__func__.__defaults__ or ())
+        stack.extend((fn.__func__.__kwdefaults__ or {}).values())
+    if isinstance(fn, torch.nn.Module):
+        stack.append(fn)
+
+    seen: set[int] = set()
+    while stack:
+        value = stack.pop()
+        identity = id(value)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        if isinstance(value, (dict, MappingProxyType)):
+            stack.extend(value.keys())
+            stack.extend(value.values())
+        elif isinstance(value, (list, tuple, set, frozenset)):
+            stack.extend(value)
+        elif isinstance(value, torch.nn.Module):
+            stack.extend(value.modules())
+            stack.extend(value.parameters())
+            stack.extend(value.buffers())
+        elif isinstance(value, weakref.ReferenceType):
+            referent = value()
+            if referent is not None:
+                stack.append(referent)
+            callback = value.__callback__
+            if callback is not None:
+                stack.append(callback)
+        elif isinstance(value, types.MethodType):
+            stack.extend((value.__func__, value.__self__))
+        elif isinstance(value, types.FunctionType):
+            stack.extend(value.__defaults__ or ())
+            stack.extend((value.__kwdefaults__ or {}).values())
+            stack.extend(value.__dict__.values())
+            for cell in value.__closure__ or ():
+                try:
+                    stack.append(cell.cell_contents)
+                except ValueError:
+                    pass
+        elif not isinstance(value, (CodeType, type, types.ModuleType)):
+            try:
+                stack.extend(vars(value).values())
+            except Exception:
+                pass
+    return seen
+
+
+def _dynamo_example_grads(
+    fn: Callable[..., object], example_inputs: Sequence[ExampleInput]
+) -> dict[int, tuple[torch.Tensor, torch.Tensor | None]]:
+    tensors: dict[int, torch.Tensor] = {}
+
+    def visit(value: object) -> None:
+        if isinstance(value, torch.nn.Module):
+            for tensor in itertools.chain(value.parameters(), value.buffers()):
+                tensors[id(tensor)] = tensor
+        elif isinstance(value, torch.Tensor):
+            tensors[id(value)] = value
+
+    receiver = fn if isinstance(fn, torch.nn.Module) else getattr(fn, "__self__", None)
+    if receiver is not None:
+        visit(receiver)
+    for example in example_inputs:
+        for value in (*example.args, *example.kwargs.values()):
+            visit(value)
+        for value in pytree.tree_leaves((example.args, example.kwargs)):
+            visit(value)
+    return {key: (tensor, tensor.grad) for key, tensor in tensors.items()}
+
+
 def _precompile_dynamo(
     fn: Callable[..., object],
     example_inputs: Sequence[tuple[object, ...] | ExampleInput],
@@ -1876,12 +2518,21 @@ def _precompile_dynamo(
     backend: str,
     decompositions: dict | None,
     training: bool,
+    recompile_limit: int,
+    dynamic: bool | None,
+    guard_filter_fn: Callable[[Sequence[Any]], Sequence[bool]] | None,
+    invariants: str | None,
+    require_complete: bool,
+    require_no_risky_drops: bool,
+    require_no_dropped_guards: bool,
 ) -> tuple[str, bytes]:
+    import contextlib
     import dis
     import importlib
     import inspect
-    import sys
     import types
+
+    import torch._functorch.config as functorch_config
 
     if not example_inputs:
         raise AssertionError(
@@ -1903,16 +2554,57 @@ def _precompile_dynamo(
                 f"or torch.compiler.ExampleInput values, got {type(example).__name__}."
             )
 
+    def check_module_state(module: torch.nn.Module) -> None:
+        state = (
+            ("parameter", module.named_parameters()),
+            ("buffer", module.named_buffers()),
+        )
+        for kind, tensors in state:
+            for name, tensor in tensors:
+                if torch.is_inference(tensor):
+                    raise PrecompileError(
+                        "precompile tracer='dynamo' found inference tensor "
+                        f"{kind} {name!r} on {type(module).__name__}; create the "
+                        "module outside torch.inference_mode()."
+                    )
+
+    if isinstance(fn, torch.nn.Module):
+        check_module_state(fn)
+    for example in examples:
+        for value in pytree.tree_leaves((example.args, example.kwargs)):
+            if isinstance(value, torch.Tensor) and torch.is_inference(value):
+                raise PrecompileError(
+                    "precompile tracer='dynamo' example_inputs cannot contain "
+                    "inference tensors; create them outside torch.inference_mode()."
+                )
+            if isinstance(value, torch.nn.Module):
+                check_module_state(value)
+
     from torch._dynamo.eval_frame import innermost_fn
-    from torch._dynamo.exc import BackendCompilerFailed, PackageError, Unsupported
+    from torch._dynamo.exc import (
+        BackendCompilerFailed,
+        FailOnRecompileLimitHit,
+        InternalTorchDynamoError,
+        PackageError,
+        RecompileError,
+        Unsupported,
+    )
     from torch._dynamo.guards import CheckFunctionManager
     from torch._dynamo.package import CompilePackage, SerializedCode
+    from torch._dynamo.pgo import _new_code_state, _use_code_state
 
-    target = innermost_fn(fn)
+    entry = fn.forward if isinstance(fn, torch.nn.Module) else fn
+    target_callable = innermost_fn(entry)
+    target = (
+        target_callable.__func__
+        if inspect.ismethod(target_callable)
+        else target_callable
+    )
+    input_object_ids = _dynamo_input_object_ids(fn, examples)
     if not inspect.isfunction(target):
         raise NotImplementedError(
             "precompile tracer='dynamo' currently requires a Python function and does "
-            "not accept an nn.Module or bound method directly as fn."
+            f"not support {type(target).__name__}."
         )
     if target.__closure__ is not None:
         raise NotImplementedError(
@@ -1924,17 +2616,6 @@ def _precompile_dynamo(
             "precompile tracer='dynamo' does not yet support nested functions that "
             "capture local variables."
         )
-
-    capture_target = types.FunctionType(
-        target.__code__.replace(),
-        target.__globals__,
-        target.__name__,
-        target.__defaults__,
-        target.__closure__,
-    )
-    capture_target.__kwdefaults__ = target.__kwdefaults__
-    capture_target.__module__ = target.__module__
-    capture_target.__qualname__ = target.__qualname__
 
     def is_literal(value: object) -> bool:
         if value is None or isinstance(value, (bool, int, float, complex, str, bytes)):
@@ -2067,73 +2748,227 @@ def _precompile_dynamo(
         )
 
     _DYNAMO_COMPILE_LOCK.acquire()
+    package: CompilePackage | None = None
+    region = -1
+    pgo_state = _new_code_state()
+    capture_stack = contextlib.ExitStack()
+    captured_guard_sets: dict[int, list[_DynamoCapturedGuardSet]] = {}
+    contract_dropped_guards: set[tuple[str, str]] = set()
+    capture_errors: list[str] = []
+    truncated: set[str] = set()
     try:
-        unsupported_capture_guards: set[tuple[str, str]] = set()
+        accumulated_limit = max(
+            torch._dynamo.config.accumulated_recompile_limit, recompile_limit
+        )
+        capture_stack.enter_context(
+            torch._dynamo.config.patch(
+                accumulated_recompile_limit=accumulated_limit,
+                fail_on_recompile_limit_hit=True,
+                allow_empty_graphs=True,
+                trace_autograd_ops=training,
+            )
+        )
+        functorch_options = {"bundled_autograd_cache": True}
+        if training:
+            functorch_options["force_non_lazy_backward_lowering"] = True
+        capture_stack.enter_context(functorch_config.patch(**functorch_options))
+        capture_stack.enter_context(_use_code_state(pgo_state))
+        capture_stack.enter_context(torch.inference_mode(False))
+        capture_stack.enter_context(
+            torch.enable_grad() if training else torch.no_grad()
+        )
 
         def keep_portable_capture_guards(guards: Sequence[Any]) -> list[bool]:
             unsupported = CheckFunctionManager.UNSUPPORTED_SERIALIZATION_GUARD_TYPES
-            result = []
-            for guard in guards:
-                is_unsupported = guard.guard_type in unsupported or any(
+            portable_guard_types = [
+                guard.guard_type not in unsupported
+                and not any(
                     derived in unsupported for derived in guard.derived_guard_types
                 )
-                if not is_unsupported:
-                    result.append(True)
+                for guard in guards
+            ]
+            # Explicit inputs, defaults, and values derived across graph breaks may
+            # vary. Known process state, globals, and unsupported values outside that
+            # input closure belong to the caller-promised invariant environment.
+            environment_assumptions = [
+                guard.guard_type in _DYNAMO_ENVIRONMENT_GUARD_TYPES
+                or guard.source_root_is_import
+                or (
+                    guard.has_value
+                    and guard.source_root_id is not None
+                    and guard.source_root_id not in input_object_ids
+                    and id(guard.value) not in input_object_ids
+                    and importable_global(guard.value) is not None
+                )
+                or (
+                    guard.source_root_id is not None
+                    and guard.source_root_id not in input_object_ids
+                    and (not guard.has_value or id(guard.value) not in input_object_ids)
+                    and (guard.is_global or guard.source_has_unsupported_value)
+                )
+                for guard in guards
+            ]
+            chosen = (
+                [True] * len(guards)
+                if guard_filter_fn is None
+                else list(guard_filter_fn(guards))
+            )
+            if len(chosen) != len(guards):
+                raise ValueError(
+                    f"guard_filter_fn returned {len(chosen)} decisions for "
+                    f"{len(guards)} guards; it must return one per guard."
+                )
+            if not all(type(decision) is bool for decision in chosen):
+                raise TypeError("guard_filter_fn decisions must all be bool values.")
+            decisions = [
+                guard_type_is_portable
+                and not guard.source_has_unsupported_value
+                and keep
+                for guard, guard_type_is_portable, keep in zip(
+                    guards, portable_guard_types, chosen, strict=True
+                )
+            ]
+            current = package._current_entry if package is not None else None
+            if current is None:
+                raise AssertionError("Dynamo guard filter ran outside a package frame")
+            dropped = set()
+            risky = set()
+            facts = []
+            records = zip(
+                guards,
+                portable_guard_types,
+                environment_assumptions,
+                chosen,
+                decisions,
+                strict=True,
+            )
+            for (
+                entry,
+                guard_type_is_portable,
+                environment_assumption,
+                selected,
+                keep,
+            ) in records:
+                slot = (
+                    entry.guard_type,
+                    _normalize_dynamo_guard_text(entry.name),
+                )
+                facts.append(_dynamo_guard_fact(entry, enforced=keep))
+                if keep:
                     continue
-                portable_global = guard.is_global
-                if not portable_global:
-                    unsupported_capture_guards.add((guard.name, guard.guard_type))
-                result.append(False)
-            return result
+                dropped.add(slot)
+                if environment_assumption:
+                    contract_dropped_guards.add(slot)
+                    continue
+                if not selected:
+                    risky.add(slot)
+                elif not guard_type_is_portable or entry.source_has_unsupported_value:
+                    value = entry.value if entry.has_value else None
+                    synthesized = entry.name.startswith(
+                        ("__nested_resume_fns", "__nested_frame_values")
+                    )
+                    if not synthesized and not (
+                        entry.is_global and importable_global(value) is not None
+                    ):
+                        risky.add(slot)
+            captured_guard_sets.setdefault(id(current), []).append(
+                _DynamoCapturedGuardSet(
+                    facts=tuple(facts),
+                    dropped=frozenset(dropped),
+                    risky_dropped=frozenset(risky),
+                    environment=frozenset(
+                        slot
+                        for slot in {
+                            (
+                                entry.guard_type,
+                                _normalize_dynamo_guard_text(entry.name),
+                            )
+                            for entry in guards
+                        }
+                        if all(
+                            is_environment
+                            for entry, is_environment in zip(
+                                guards, environment_assumptions, strict=True
+                            )
+                            if (
+                                entry.guard_type,
+                                _normalize_dynamo_guard_text(entry.name),
+                            )
+                            == slot
+                        )
+                    ),
+                )
+            )
+            return decisions
 
         package = CompilePackage(
-            capture_target, serialization_guard_filter_fn=keep_portable_capture_guards
+            target_callable,
+            serialization_guard_filter_fn=keep_portable_capture_guards,
         )
-        compiled = torch._dynamo.optimize(
+        context = torch._dynamo.optimize(
             backend=_dynamo_backend_compiler(backend, training),
             nopython=False,
             package=package,
-            dynamic=None,
-        )(capture_target)
-        if training:
-            with torch.enable_grad():
-                for example in examples:
-                    compiled(*example.args, **example.kwargs)
-        else:
+            dynamic=dynamic,
+            recompile_limit=recompile_limit,
+            isolate_recompiles=True,
+        )
+        region = context._isolate_recompiles_id
+        compiled = context(fn)
+        saved_grads = _dynamo_example_grads(fn, examples)
+        try:
+            with torch.no_grad():
+                for tensor, _ in saved_grads.values():
+                    tensor.grad = None
             for example in examples:
-                compiled(*example.args, **example.kwargs)
-
-        if unsupported_capture_guards:
-            details = ", ".join(
-                f"{name} ({guard_type})"
-                for name, guard_type in sorted(unsupported_capture_guards)
-            )
-            raise PrecompileError(
-                "precompile tracer='dynamo' cannot serialize identity-dependent "
-                f"example dispatch guards: {details}."
-            )
+                try:
+                    compiled(*example.args, **example.kwargs)
+                except (FailOnRecompileLimitHit, RecompileError) as e:
+                    truncated.add(target.__qualname__)
+                    capture_errors.append(f"{type(e).__name__}: {e}")
+                    if require_complete:
+                        raise
+        finally:
+            with torch.no_grad():
+                for tensor, grad in saved_grads.values():
+                    tensor.grad = grad
 
         cache_entry = package.cache_entry()
         code_entries = cache_entry.codes
+        module_hint = (
+            " Capture a Python function that calls the module and pass the module "
+            "as an example argument."
+            if isinstance(fn, torch.nn.Module)
+            else ""
+        )
         if not code_entries:
             raise PrecompileError(
                 "precompile tracer='dynamo' did not capture a runnable entry frame."
+                + module_hint
             )
         main_code = code_entries[0]
         if main_code.install_to_global or not main_code.guarded_codes:
+            if main_code.bypassed:
+                reason = getattr(main_code, "bypass_reason", None)
+                detail = f" Dynamo reported: {reason}" if reason else ""
+                raise PrecompileError(
+                    "precompile tracer='dynamo' bypassed its entry frame during "
+                    "capture, so there is no dispatchable artifact." + detail
+                )
             raise PrecompileError(
                 "precompile tracer='dynamo' did not capture a runnable entry frame."
+                + module_hint
             )
         bypassed = [
-            SerializedCode.to_code_object(code.python_code).co_name
+            (
+                f"{SerializedCode.to_code_object(code.python_code).co_name}: "
+                f"{getattr(code, 'bypass_reason', None)}"
+                if getattr(code, "bypass_reason", None)
+                else SerializedCode.to_code_object(code.python_code).co_name
+            )
             for code in code_entries
             if code.bypassed
         ]
-        if bypassed:
-            raise PrecompileError(
-                "precompile tracer='dynamo' cannot build a complete artifact because "
-                f"Dynamo bypassed captured frame(s): {sorted(bypassed)!r}."
-            )
         backend_ids = []
         for code in code_entries:
             for backend_id in code.backend_ids:
@@ -2152,8 +2987,10 @@ def _precompile_dynamo(
         code_states: list[_DynamoCodeState] = []
         disabled_functions: dict[str, _DynamoDisabledFunction] = {}
         filtered_code_entries = []
-        observed_scopes = package.observed_scopes()
-        for index, (code, scopes) in enumerate(zip(code_entries, observed_scopes)):
+        kept_by_entry: dict[int, list[frozenset[tuple[str, str]]]] = {}
+        policy_dropped_guards = set(contract_dropped_guards)
+        unportable_globals: set[tuple[str, str]] = set()
+        for index, code in enumerate(code_entries):
             original_code = SerializedCode.to_code_object(code.python_code)
             runtime_globals = sys.modules[code.python_module].__dict__
             runtime_codes = [
@@ -2178,18 +3015,19 @@ def _precompile_dynamo(
                         continue
                     binding = importable_global(value)
                     if binding is None:
-                        raise PrecompileError(
-                            "precompile tracer='dynamo' cannot make transformed global "
-                            f"{name!r} portable; use an importable value or a closure-free "
-                            "torch._dynamo.disable function."
-                        )
+                        unportable_globals.add((code.python_module, name))
+                        continue
                     global_bindings[name] = binding
-            filtered_guard_states = _filter_dynamo_guards(
+            finalized = _filter_dynamo_guards(
                 original_code,
                 runtime_globals,
                 code.guarded_codes,
-                scopes,
+                captured_guard_sets.get(id(code), ()),
+                package.live_guard_leaves(code),
             )
+            filtered_guard_states = finalized.states
+            kept_by_entry[id(code)] = list(finalized.kept_slots)
+            policy_dropped_guards.update(finalized.policy_dropped)
             variants = tuple(
                 _DynamoGuardedVariant(guards_state, guarded.dynamo_code)
                 for guarded, guards_state in zip(
@@ -2233,18 +3071,123 @@ def _precompile_dynamo(
                     global_bindings=global_bindings,
                     value_globals=value_globals,
                     import_sources=dict(code.import_sources),
-                    defaults=capture_target.__defaults__ if index == 0 else None,
-                    kwdefaults=capture_target.__kwdefaults__ if index == 0 else None,
+                    defaults=target.__defaults__ if index == 0 else None,
+                    kwdefaults=target.__kwdefaults__ if index == 0 else None,
                     variants=variants,
                 )
             )
 
         serving_mode = _dynamo_serving_mode(code_states)
+        if serving_mode == "standalone" and unportable_globals:
+            module_name, name = sorted(unportable_globals)[0]
+            raise PrecompileError(
+                "precompile tracer='dynamo' cannot make transformed global "
+                f"{name!r} from {module_name!r} portable; use an importable value, "
+                "a closure-free torch._dynamo.disable function, or a capture whose "
+                "nested frame requires installed mode."
+            )
+        frame_invariants = _dynamo_frame_invariants(
+            code_entries, captured_guard_sets, kept_by_entry
+        )
+        dropped_guards = {
+            slot
+            for records in captured_guard_sets.values()
+            for record in records
+            for slot in record.dropped
+        }
+        dropped_guards.update(policy_dropped_guards)
+        risky_dropped_guards = {
+            slot
+            for records in captured_guard_sets.values()
+            for record in records
+            for slot in record.risky_dropped
+        }
+        kept_guards = {
+            slot
+            for variants in kept_by_entry.values()
+            for slots in variants
+            for slot in slots
+        }
+        uncovered = tuple(
+            sorted(
+                SerializedCode.to_code_object(code.python_code).co_name
+                for code in code_entries
+                if code.has_compile_id and not code.bypassed and not code.guarded_codes
+            )
+        )
+        summary = PrecompileSummary(
+            frames=len(code_entries),
+            resume_functions=sum(code.install_to_global for code in code_entries),
+            guarded_codes=sum(len(code.guarded_codes) for code in code_entries),
+            backend_graphs=len(compiled_backends),
+            bypassed=tuple(sorted(bypassed)),
+            truncated=tuple(sorted(truncated)),
+            uncovered_frames=uncovered,
+            wont_generalize=_dynamo_wont_generalize(kept_guards),
+            dropped_guards=tuple(sorted(dropped_guards)),
+            kept_guards=tuple(sorted(kept_guards)),
+            risky_dropped_guards=tuple(sorted(risky_dropped_guards)),
+            policy_dropped_guards=tuple(sorted(policy_dropped_guards)),
+            capture_errors=tuple(capture_errors),
+        )
+        if require_complete and not summary.complete:
+            raise PrecompileError(
+                "precompile tracer='dynamo' captured an incomplete artifact: "
+                f"{summary}. Pass require_complete=False only after auditing the "
+                "missing coverage."
+            )
+        if require_no_dropped_guards and summary.dropped_guards:
+            raise PrecompileError(
+                "precompile tracer='dynamo' dropped environment-contract, "
+                "unserializable, or caller-filtered guards: "
+                f"{list(summary.dropped_guards)}. Pass "
+                "require_no_dropped_guards=False to accept them."
+            )
+        if require_no_risky_drops and summary.risky_dropped_guards:
+            raise PrecompileError(
+                "precompile tracer='dynamo' dropped guards that can affect "
+                f"dispatch: {list(summary.risky_dropped_guards)}. Make the guarded "
+                "value portable or pass require_no_risky_drops=False to accept the "
+                "risk explicitly."
+            )
+        if summary.risky_dropped_guards:
+            log.warning(
+                "precompile: dropped guards can affect dispatch and are unchecked "
+                "after load: %s",
+                list(summary.risky_dropped_guards),
+            )
+        if summary.wont_generalize:
+            log.warning(
+                "precompile: values are pinned to the captured examples: %s",
+                list(summary.wont_generalize),
+            )
+        if invariants is not None:
+            _write_dynamo_invariants(invariants, target, frame_invariants)
+        mutates_input_grads = any(
+            _dynamo_code_writes_grad(SerializedCode.to_code_object(variant.dynamo_code))
+            for code_state in code_states
+            for variant in code_state.variants
+        )
+        runtime_examples = (
+            [ExampleInput((fn, *example.args), example.kwargs) for example in examples]
+            if isinstance(fn, torch.nn.Module)
+            else examples
+        )
         state = _DynamoArtifactState(
             codes=tuple(code_states),
             disabled_functions=disabled_functions,
-            input_contract=_dynamo_input_contract(examples),
+            input_contract=_dynamo_input_contract(runtime_examples),
             serving_mode=serving_mode,
+            entry_module=target.__module__,
+            entry_qualname=target.__qualname__,
+            entry_name=target.__code__.co_name,
+            entry_firstlineno=target.__code__.co_firstlineno,
+            device_type=cache_entry.device_type,
+            system_info=cache_entry.system_info,
+            mutates_input_grads=mutates_input_grads,
+            recompile_limit=recompile_limit,
+            dynamic=dynamic,
+            summary=summary,
             package=(
                 dataclasses.replace(cache_entry, codes=filtered_code_entries)
                 if serving_mode == "installed"
@@ -2272,9 +3215,18 @@ def _precompile_dynamo(
         if isinstance(e.inner_exception, PrecompileError):
             raise e.inner_exception from e
         raise
+    except InternalTorchDynamoError as e:
+        raise PrecompileError(
+            f"precompile tracer='dynamo' failed during capture: {e}"
+        ) from e
     except PackageError as e:
         raise PrecompileError(
             f"precompile tracer='dynamo' could not serialize the capture: {e}"
+        ) from e
+    except (FailOnRecompileLimitHit, RecompileError) as e:
+        raise PrecompileError(
+            "precompile tracer='dynamo' could not capture every example before "
+            f"recompile_limit={recompile_limit}: {e}"
         ) from e
     except AssertionError as e:
         if "guards_state must not be None" not in str(e):
@@ -2284,10 +3236,25 @@ def _precompile_dynamo(
             "cannot serialize yet (for example a module or callable guard)."
         ) from e
     finally:
-        _DYNAMO_COMPILE_LOCK.release()
+        try:
+            capture_stack.close()
+        finally:
+            try:
+                if package is not None and region >= 0:
+                    from torch._dynamo.eval_frame import _clear_cache_entries_for_region
+
+                    for code in package.region_codes():
+                        _clear_cache_entries_for_region(code, region)
+                pgo_state.clear()
+            finally:
+                _DYNAMO_COMPILE_LOCK.release()
 
 
-class PrecompiledModule:
+class _PrecompileHandle:
+    """Marker for loaded artifact handles that guard serialization must prune."""
+
+
+class PrecompiledModule(_PrecompileHandle):
     """Internal holder for a precompiled computation / a loaded runnable."""
 
     def __init__(
@@ -2504,6 +3471,22 @@ class PrecompiledModule:
             if unload is not None:
                 unload()
 
+    def serve_time_compiles(self) -> int:
+        """Return the number of graphs compiled after this artifact was loaded."""
+        if self._loaded_forward is None:
+            raise PrecompileError("precompile artifact has not been loaded")
+        count = getattr(self._loaded_forward, "serve_time_compiles", None)
+        return 0 if count is None else cast("int", count())
+
+    @property
+    def capture_summary(self) -> PrecompileSummary | None:
+        if self._loaded_forward is None:
+            return None
+        return cast(
+            "PrecompileSummary | None",
+            getattr(self._loaded_forward, "capture_summary", None),
+        )
+
     def to_python_code(self) -> str:
         """Return the executable Python artifact as a string.
 
@@ -2623,12 +3606,19 @@ class _PrecompileApi:
     def __call__(
         self,
         fn: Callable[..., object],
-        *,
-        example_inputs: Sequence[tuple[object, ...] | ExampleInput],
+        *example_args: object,
+        example_inputs: Sequence[tuple[object, ...] | ExampleInput] | None = None,
         backend: str = "inductor",
         tracer: str = "make_fx",
         decompositions: dict | None = None,
         training: bool = False,
+        recompile_limit: int = 256,
+        dynamic: bool | None = None,
+        guard_filter_fn: Callable[[Sequence[Any]], Sequence[bool]] | None = None,
+        invariants: str | None = None,
+        require_complete: bool = True,
+        require_no_risky_drops: bool = True,
+        require_no_dropped_guards: bool = False,
     ) -> tuple[str, bytes]:
         """Ahead-of-time precompile ``fn`` against ``example_inputs``.
 
@@ -2646,11 +3636,14 @@ class _PrecompileApi:
         ``example_inputs`` is a sequence of positional-argument tuples or
         :class:`torch.compiler.ExampleInput` values for ``fn``. ``ExampleInput`` adds
         keyword arguments for the Dynamo tracer.
+        For compatibility, positional arguments after ``fn`` describe one example call;
+        they cannot be combined with ``example_inputs``.
         The outer sequence supports capture front-ends that can specialize one artifact
         from multiple calls. The ``make_fx`` tracer accepts exactly one tuple because it
         records only one execution; ``dynamo`` executes every tuple and records the
-        guarded recompilations they trigger. The Dynamo artifact retains serialized
-        local-derived guards and treats the Python environment as invariant.
+        guarded recompilations they trigger. The Dynamo artifact filters serialized guard
+        records under its input-only recompilation contract while preserving how every
+        example dispatches among those variants.
 
         THREADING: the inductor lowering step drives process-global compiler state
         and is serialized by an internal lock, so concurrent ``backend="inductor"``
@@ -2667,12 +3660,14 @@ class _PrecompileApi:
           holds the save_cache_artifacts bundle that primes the inductor cache on load.
         - ``"eager"``: do NOT lower -- keep the captured ATen graph and run it as-is
           (analogous to ``torch.compile(backend="eager")``). ``python_code`` inlines
-          the readable captured graph (both the inspectable rendering and the
-          executable artifact); the eager cache carries no compiled artifact
+          the readable captured graph. Higher-order graph bodies are readable Python;
+          their FX structure is also embedded because eager HOP interpreters require a
+          real ``Graph`` at runtime. Loading recompiles that structure to bytecode but
+          never symbolically retraces it. The eager cache carries no compiled artifact
           (artifact=None) but is still a full integrity-tagged envelope -- with no
           kernels there is nothing to accelerate, so ``load`` runs the inlined graph.
-          Useful for
-          inspecting/debugging exactly what was traced without an Inductor dependency.
+          Useful for inspecting/debugging exactly what was traced without an Inductor
+          dependency.
 
         ``tracer`` selects the capture front-end:
 
@@ -2682,23 +3677,37 @@ class _PrecompileApi:
           to the example (the source of the programming-model contract).
         - ``"dynamo"``: analyze a Python function's bytecode and capture every guarded
           specialization/recompilation exercised by ``example_inputs``. The emitted
-          artifact retains guards derived from runtime locals. Guards covering the
-          Python environment may be removed because that environment is required to be
-          unchanged between capture and runtime. A call that fails every retained guard
-          set raises instead of compiling at runtime. Graph breaks are preserved through
-          their Dynamo resume frames;
+          artifact drops a serialized guard record only when doing so preserves every
+          example's variant-match results, or when the guard only checks process-local
+          state outside the explicit inputs. The Python environment -- including
+          globals and context-manager state -- must be semantically identical between
+          capture and runtime, and only explicit inputs may vary in a way that causes a
+          recompile. Environment-only checks are therefore caller assumptions rather
+          than dispatch predicates. By default, every portable input-derived guard is
+          retained. Each guard is rebuilt independently from frozen capture state; an
+          input-derived rebuild failure or changed predicate raises, while an
+          environment-only failure is omitted with dependent attribute checks.
+          Filtering is at guard-record granularity, so a retained composite record can
+          still rebuild invariant leaf checks. Breaking an unchecked assumption can
+          silently miscompute.
+          A standalone call that fails every retained guard set raises. An installed
+          artifact can compile an uncovered call with its selected backend. Graph breaks
+          are preserved through their Dynamo resume frames;
           closure-free Python functions wrapped with ``torch._dynamo.disable`` are
           embedded and execute eagerly between graph segments. The top-level function
           must not have closure cells or nested functions that capture locals. Globals
-          left in transformed bytecode must be literal values or independently
-          importable objects. Disabled functions cannot assign globals or use
+          left in standalone transformed bytecode must be literal values or independently
+          importable objects; installed frames may resolve them from their defining
+          module. Disabled functions cannot assign globals or use
           ``globals()``, ``eval()``, or ``exec()``; their importable module globals are
           rebound at load, while recursive literal globals and defaults are captured by
           value. ``nn.Module`` arguments are accepted and checked against the captured
           module type, training mode, parameter/buffer structure, aliasing, and tensor
           metadata. Frames reachable only through ordinary Python calls use an isolated
-          installed artifact; loading remains side-effect free, the first call installs,
-          and ``unload()`` (or context-manager exit) removes the artifact's state.
+          installed artifact. Loading prepares its backends and guard trees without
+          installing them; the first call installs. An uncovered call logs a warning and
+          increments ``serve_time_compiles()``. ``unload()`` (or context-manager exit)
+          removes the artifact's state.
 
         ``decompositions`` is an optional decomposition table (a dict mapping each
         ``OpOverload`` to a decomposition function) forwarded to ``make_fx`` as its
@@ -2706,18 +3715,38 @@ class _PrecompileApi:
         broken down in the captured graph. Defaults to ``None`` (make_fx's default) and
         is not yet supported with ``tracer="dynamo"``.
 
-        ``training=True`` is supported with ``tracer="dynamo"`` and
-        ``backend="inductor"``. Capture runs with grad enabled, and each compiled graph
-        carries a readable AOTAutograd forward and backward bridged by an emitted
-        ``torch.autograd.Function``. A served output therefore retains its ``grad_fn``;
-        calling ``backward()`` executes the precompiled backward kernels. The input
-        tensors that require gradients must do so in every example and at runtime.
+        ``recompile_limit`` bounds the number of variants captured per code object.
+        ``dynamic`` has the same meaning as for :func:`torch.compile`; ``None`` enables
+        automatic dynamic-shape promotion as dimensions vary across examples.
+
+        ``guard_filter_fn`` receives each candidate Dynamo guard sequence and returns
+        one bool per guard. It can narrow the portable default set but cannot restore a
+        guard Dynamo cannot serialize. Input guards removed by this callback are risky
+        drops and are rejected unless ``require_no_risky_drops=False``. After all examples
+        run, precompile drops guards covered by the invariant-environment contract and
+        verifies that retained frozen facts still distinguish the captured variants.
+        ``invariants`` optionally names a text file receiving the resulting invariant,
+        varying, and undetermined guard report.
+
+        ``require_complete`` rejects captures with bypassed, truncated, uncovered, or
+        failed frames. ``require_no_risky_drops`` rejects dropped guards that could alter
+        dispatch and defaults to true. ``require_no_dropped_guards`` rejects every drop;
+        it defaults to false because ordinary captures contain unserializable identity
+        guards. The loaded callable exposes the final :class:`PrecompileSummary` as
+        ``capture_summary``.
+
+        ``training=True`` is supported with ``tracer="dynamo"`` on both backends.
+        Capture runs with grad enabled and served outputs retain their ``grad_fn``.
+        Inductor graphs carry readable AOTAutograd forward and backward source bridged
+        by an emitted ``torch.autograd.Function``; eager graphs replay their captured
+        differentiable operations. The input tensors that require gradients must do so
+        in every example and at runtime.
 
         With ``tracer="dynamo"``, shape variation across ``example_inputs`` uses
         Dynamo's ordinary automatic dynamic-shape policy: for example, a static first
         graph can recompile into a symbolic graph when a later tuple changes a dimension.
-        The symbolic graphs and their local-derived dispatch guards are retained in the
-        artifact.
+        The symbolic graphs and contract-filtered dispatch guard records are retained in
+        the artifact.
 
         With ``tracer="make_fx"``, dynamic shapes are opt-in via
         ``torch._dynamo.decorators.mark_unbacked``
@@ -2731,13 +3760,10 @@ class _PrecompileApi:
         runtime asserts. Other dims stay static.
         Dims that MUST be equal at runtime (e.g. two inputs combined by a broadcast that
         requires equal sizes, ``model(a) + model(b)``) MUST be given a SHARED ``shape_id``
-        so a mismatch is rejected; marking two such dims INDEPENDENTLY currently bakes a
-        SILENT equal-size assumption and a runtime mismatch does NOT raise the loud failure
-        eager gives (invariant 3). This is a harvesting gap, not an inherent limit of the
-        standalone artifact: the capture ShapeEnv DOES record the equality (as a deferred
-        runtime assert, e.g. ``Eq(u0, u1)``), but precompile does not yet harvest/enforce
-        those relational asserts in the driver -- only the decorator's declared min/max feed
-        the runtime bound checks. A shared ``shape_id`` is the way to get the check today.
+        so a mismatch is rejected. Any new deferred runtime shape constraint that the
+        standalone driver cannot enforce, whether between independently marked input
+        dims or on a derived data-dependent size, raises ``PrecompileError`` instead of
+        baking the example relation.
 
         Returns ``(python_code, cache)`` -- an executable Python source string (the
         single source of truth for the calling convention) and a
@@ -2774,6 +3800,11 @@ class _PrecompileApi:
         returns ``fn``'s own result (``None`` for a bare ``.backward()`` step), not the
         grads (invariant 5).
 
+        When ``fn`` itself is an ``nn.Module``, its ``forward`` method is captured and
+        the reloaded callable takes the runtime module as its first argument, followed by
+        the arguments from each example, so weights remain runtime inputs rather than
+        being baked into the artifact.
+
         Input mutation (incl. module buffers, e.g. BatchNorm running stats in
         training mode), tensor subclasses (e.g. DTensor), and outputs aliasing inputs
         are supported -- AOTAutograd's prelude/epilogue is composed into the artifact
@@ -2787,6 +3818,25 @@ class _PrecompileApi:
         the example's (invariant 6).
         """
         torch._C._log_api_usage_once("torch.compiler.precompile")
+        if example_inputs is None:
+            example_inputs = [tuple(example_args)]
+        elif example_args:
+            raise TypeError(
+                "precompile cannot take both positional examples and example_inputs."
+            )
+        if isinstance(example_inputs, Sequence) and len(example_inputs) == 0:
+            raise ValueError(
+                "precompile requires example_inputs=[(...), ...]: one tuple or "
+                "torch.compiler.ExampleInput per call to capture."
+            )
+        if isinstance(
+            example_inputs, (torch.Tensor, torch.nn.Module, str)
+        ) or not isinstance(example_inputs, Sequence):
+            raise TypeError(
+                "precompile example_inputs takes a sequence of calls, not "
+                f"{type(example_inputs).__name__}. Wrap one call as "
+                "example_inputs=[(arg0, arg1)]."
+            )
         if backend not in ("inductor", "eager"):
             raise ValueError(
                 f"precompile backend must be 'inductor' or 'eager', got {backend!r}."
@@ -2795,10 +3845,24 @@ class _PrecompileApi:
             raise ValueError(
                 f"precompile tracer must be 'make_fx' or 'dynamo', got {tracer!r}."
             )
-        if training and (tracer != "dynamo" or backend != "inductor"):
+        if training and tracer != "dynamo":
             raise NotImplementedError(
-                "precompile training=True currently requires tracer='dynamo' and "
-                "backend='inductor'."
+                "precompile training=True currently requires tracer='dynamo'."
+            )
+        if recompile_limit <= 0:
+            raise ValueError("precompile recompile_limit must be positive")
+        if tracer == "make_fx" and (
+            recompile_limit != 256
+            or dynamic is not None
+            or guard_filter_fn is not None
+            or invariants is not None
+            or not require_complete
+            or not require_no_risky_drops
+            or require_no_dropped_guards
+        ):
+            raise ValueError(
+                "precompile guard_filter_fn, recompile_limit, dynamic, invariants, "
+                "and require_* options apply only to tracer='dynamo'."
             )
         if tracer == "dynamo":
             return _precompile_dynamo(
@@ -2807,6 +3871,13 @@ class _PrecompileApi:
                 backend=backend,
                 decompositions=decompositions,
                 training=training,
+                recompile_limit=recompile_limit,
+                dynamic=dynamic,
+                guard_filter_fn=guard_filter_fn,
+                invariants=invariants,
+                require_complete=require_complete,
+                require_no_risky_drops=require_no_risky_drops,
+                require_no_dropped_guards=require_no_dropped_guards,
             )
         make_fx_examples = []
         for example in example_inputs:
@@ -2852,11 +3923,13 @@ class _PrecompileApi:
         param/buffer list from it (same interning/order as capture).
 
         A Dynamo artifact containing nested frames that a source dispatcher cannot
-        reach installs its package lazily on first use. Pass ``fn=`` to bind that
-        package to a live callable instead of reconstructing the entry function. Its
-        defining modules must still be importable. Such an artifact supports
-        ``unload()`` and the context-manager protocol; both remove only that artifact's
-        isolated entries.
+        reach prepares its package while loading, then installs it lazily on first use.
+        Pass ``fn=`` to bind that package to a live callable instead of reconstructing
+        the entry function. Its defining modules must still be importable. Such an
+        artifact supports ``unload()`` and the context-manager protocol; both remove
+        only that artifact's isolated entries. ``serve_time_compiles()`` reports any
+        uncovered graphs it compiled after loading; each such compile also logs a
+        warning.
 
         Raises ``PrecompileError`` if ``python_code`` is malformed or is not a
         ``torch.compiler.precompile`` artifact (it fails to parse, or is missing the
@@ -2968,6 +4041,9 @@ class _PrecompileApi:
             rebind = getattr(forward, "_rebind", None)
             if rebind is not None:
                 rebind(fn)
+        prepare = getattr(forward, "_prepare", None)
+        if prepare is not None:
+            prepare()
 
         return PrecompiledModule._from_loaded(forward, backend=backend)
 
