@@ -4,9 +4,11 @@
 #include <array>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <deque>
 #include <mutex>
 #include <shared_mutex>
+#include <unordered_map>
 
 // WARNING: Be careful when adding new includes here. This header will be used
 // in model.so, and should not refer to any aten/c10 headers except the stable
@@ -263,7 +265,10 @@ class AOTInductorModelContainer {
           "Unknown constant state: " + toStringConstantState(const_folded));
     }
 
-    auto* model = get_available_model();
+    // `stream` is the execution stream handle supplied by the caller. The
+    // CUDA runner resolves a null handle to the current device stream, so this
+    // identifies the active device stream rather than the host thread.
+    auto* model = get_available_model(stream);
 
     try {
       model->run(input_handles, output_handles, stream, proxy_executor);
@@ -948,6 +953,12 @@ class AOTInductorModelContainer {
   // completion.
   std::deque<AOTInductorModel*> pending_models_;
 
+  bool use_stream_affinity_{stream_affinity_enabled()};
+  // Affinity mappings persist while a model moves between available, checked
+  // out, and pending states. A bound stream waits for that model before reuse.
+  std::unordered_map<DeviceStreamType, AOTInductorModel*> stream_models_;
+  std::unordered_map<AOTInductorModel*, DeviceStreamType> model_streams_;
+
   // Protects available_models_ and pending_models_.
   std::mutex models_mutex_;
 
@@ -978,6 +989,77 @@ class AOTInductorModelContainer {
     auto* result = available_models_.back();
     available_models_.pop_back();
     return result;
+  }
+
+  AOTInductorModel* get_available_model(DeviceStreamType stream) {
+    if (!use_stream_affinity_) {
+      return get_available_model();
+    }
+
+    std::unique_lock lk(models_mutex_);
+    const auto stream_it = stream_models_.find(stream);
+    if (stream_it != stream_models_.end()) {
+      auto* model = stream_it->second;
+      const auto available_it =
+          std::find(available_models_.begin(), available_models_.end(), model);
+      if (available_it != available_models_.end()) {
+        available_models_.erase(available_it);
+        return model;
+      }
+
+      const auto pending_it =
+          std::find(pending_models_.begin(), pending_models_.end(), model);
+      if (pending_it != pending_models_.end()) {
+        pending_models_.erase(pending_it);
+        lk.unlock();
+        try {
+          model->wait_for_completion();
+        } catch (...) {
+          lk.lock();
+          available_models_.push_back(model);
+          throw;
+        }
+        return model;
+      }
+
+      model_streams_.erase(model);
+      stream_models_.erase(stream_it);
+    }
+
+    // When active streams outnumber model instances, affinity cannot remain
+    // one-to-one. Wait for any model to become reusable, then rebind it to this
+    // stream; bind_model_to_stream() removes its previous stream association.
+    while (available_models_.empty()) {
+      reclaim_finished_models(lk);
+    }
+    auto* model = available_models_.back();
+    available_models_.pop_back();
+    bind_model_to_stream(model, stream);
+    return model;
+  }
+
+  static bool stream_affinity_enabled() {
+    const char* value = std::getenv("AOTI_RUNTIME_STREAM_AFFINITY");
+    return value != nullptr && value[0] == '1' && value[1] == '\0';
+  }
+
+  void bind_model_to_stream(
+      AOTInductorModel* model,
+      DeviceStreamType stream) {
+    const auto model_it = model_streams_.find(model);
+    if (model_it != model_streams_.end()) {
+      stream_models_.erase(model_it->second);
+      model_streams_.erase(model_it);
+    }
+
+    const auto stream_it = stream_models_.find(stream);
+    if (stream_it != stream_models_.end()) {
+      model_streams_.erase(stream_it->second);
+      stream_models_.erase(stream_it);
+    }
+
+    stream_models_.emplace(stream, model);
+    model_streams_.emplace(model, stream);
   }
 
   // This mutex is used to protect execution of model.
@@ -1011,7 +1093,6 @@ class AOTInductorModelContainer {
       pending_models_.erase(it, pending_models_.end());
       return;
     }
-
     pending_models_available_.wait(
         lk, [this]() { return !pending_models_.empty(); });
     // Let's make the schedule simple first. We always wait on the first
