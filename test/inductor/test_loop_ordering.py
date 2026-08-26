@@ -445,6 +445,48 @@ class ImplDetailTest(MockSchedulerTest):
             z2 + 49 * z1 + 2401 * ModularIndexing(z3, 1, 64),
         )
 
+    def test_broadcast_orders_allow_mixed_identity_children(self):
+        scale = ir.TensorBox.create(
+            ir.Buffer(
+                name="scale",
+                layout=ir.FixedLayout(
+                    torch.device(GPU_TYPE), torch.float32, [6, 7], [7, 1]
+                ),
+            )
+        )
+        load_scale = scale.make_loader()
+
+        def make_node(ranges, indexed_dims):
+            def inner_fn(index):
+                return load_scale([index[indexed_dims[0]], index[indexed_dims[1]]]) * 2
+
+            buf = ir.Pointwise.create(
+                device=torch.device(GPU_TYPE),
+                dtype=torch.float32,
+                inner_fn=inner_fn,
+                ranges=ranges,
+            )
+            buf.realize()
+            computed = buf.data.data
+            computed.decide_layout()
+            return SchedulerNode(V.graph.scheduler, computed)
+
+        ordered = make_node([6, 7, 16, 16], (0, 1))
+        interleaved = make_node([6, 16, 7, 16], (0, 2))
+        reduction = mock.Mock()
+        reduction.get_buffer_names.return_value = OrderedSet(["scale"])
+
+        scheduler = Scheduler.__new__(Scheduler)
+        self.assertEqual(
+            scheduler._pointwise_reduction_broadcast_orders(
+                reduction,
+                [ordered, interleaved],
+                sympy.Integer(42),
+                sympy.Integer(256),
+            ),
+            [(0, 1, 2, 3), (0, 2, 1, 3)],
+        )
+
     def test_weighted_cost_penalizes_uncoalesced(self):
         self.assertEqual(MemoryCoalescing(10, 0).weighted_cost(), 10)
         self.assertEqual(MemoryCoalescing(0, 10).weighted_cost(), 160)
@@ -971,6 +1013,85 @@ class LoopOrderingTest(TestCase):
         self.do_acc_test(f, x)
         # Block reduction + broadcast pointwise should fuse into 1 kernel
         self.assertEqual(1, metrics.generated_kernel_count)
+
+    @staticmethod
+    def _square_block_broadcast(x):
+        block_size = 16
+        rows, cols = x.shape
+        blocks = (
+            x.reshape(
+                rows // block_size,
+                block_size,
+                cols // block_size,
+                block_size,
+            )
+            .permute(0, 2, 1, 3)
+            .contiguous()
+        )
+        scale = blocks.abs().amax(dim=(-2, -1), keepdim=True).clamp(min=1e-6)
+        quantized = blocks / scale
+        output = quantized.permute(0, 2, 1, 3).contiguous().reshape(rows, cols)
+        return output, scale.squeeze(-1).squeeze(-1)
+
+    def test_square_block_broadcast_vertical_fusion(self):
+        block_size = 16
+
+        original_memory = Scheduler._selected_tiling_memory
+        individual_sizes = []
+
+        def record_memory(scheduler, nodes):
+            if len(nodes) == 1:
+                individual_sizes.extend(
+                    tuple(sn._sizes[0]) for sn in nodes[0].get_nodes()
+                )
+            return original_memory(scheduler, nodes)
+
+        x = torch.randn(6 * block_size, 7 * block_size, device=GPU_TYPE)
+        with mock.patch.object(Scheduler, "_selected_tiling_memory", record_memory):
+            self.do_acc_test(self._square_block_broadcast, x)
+        self.assertEqual(1, metrics.generated_kernel_count)
+        self.assertIn((6, 16, 7, 16), individual_sizes)
+        self.assertNotIn((6, 7, 16, 16), individual_sizes)
+
+    @inductor_config.patch(loop_ordering_after_fusion=False)
+    def test_square_block_broadcast_respects_disabled_loop_ordering(self):
+        x = torch.randn(6 * 16, 7 * 16, device=GPU_TYPE)
+        self.do_acc_test(self._square_block_broadcast, x)
+        self.assertEqual(2, metrics.generated_kernel_count)
+
+    @inductor_config.patch(force_disable_caches=True)
+    def test_square_block_broadcast_reindex_rollback(self):
+        block_size = 16
+
+        def f(x):
+            blocks = (
+                x.reshape(6, block_size, 7, block_size).permute(0, 2, 1, 3).contiguous()
+            )
+            scale = blocks.abs().amax(dim=(-2, -1), keepdim=True).clamp(min=1e-6)
+            output = (blocks / scale).permute(0, 2, 1, 3).contiguous()
+            return output, scale
+
+        original_restore = _LoopStateSnapshot.restore
+        restored = []
+
+        def record_restore(snapshot):
+            original_restore(snapshot)
+            for sn, state in snapshot.scheduler_node_states.items():
+                self.assertEqual(state, sn.snapshot_loop_state())
+            restored.append(True)
+
+        x = torch.randn(6 * block_size, 7 * block_size, device=GPU_TYPE)
+        with (
+            mock.patch.object(
+                Scheduler,
+                "_reindexing_regresses_memory_coalescing",
+                return_value=True,
+            ),
+            mock.patch.object(_LoopStateSnapshot, "restore", record_restore),
+        ):
+            self.do_acc_test(f, x)
+        self.assertTrue(restored)
+        self.assertEqual(2, metrics.generated_kernel_count)
 
     def test_floordiv_broadcast_with_preceding_reduction(self):
         """
